@@ -1,0 +1,4304 @@
+--- examples/audio_streaming.rs ---
+use cpal::{
+    SampleFormat, SampleRate, StreamConfig, SupportedStreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
+use crossbeam_channel::{Receiver, Sender, bounded};
+use gemini_live_api::{
+    GeminiLiveClientBuilder,
+    client::{ServerContentContext, UsageMetadataContext},
+    types::*,
+};
+use std::{
+    env,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
+use tokio::sync::Notify;
+use tracing::{debug, error, info, trace, warn};
+
+#[derive(Clone, Debug)]
+struct AudioAppState {
+    full_response_text: Arc<StdMutex<String>>,
+    interaction_complete_signal: Arc<Notify>,
+    playback_sender: Arc<Sender<Vec<i16>>>,
+    capturing_audio: Arc<StdMutex<bool>>,
+}
+
+impl Default for AudioAppState {
+    fn default() -> Self {
+        let (pb_sender, _) = bounded(100);
+        AudioAppState {
+            full_response_text: Arc::new(StdMutex::new(String::new())),
+            interaction_complete_signal: Arc::new(Notify::new()),
+            playback_sender: Arc::new(pb_sender),
+            capturing_audio: Arc::new(StdMutex::new(false)),
+        }
+    }
+}
+
+const INPUT_SAMPLE_RATE_HZ: u32 = 16000;
+const INPUT_CHANNELS_COUNT: u16 = 1;
+const OUTPUT_SAMPLE_RATE_HZ: u32 = 24000;
+const OUTPUT_CHANNELS_COUNT: u16 = 1;
+
+async fn handle_on_content(ctx: ServerContentContext, app_state: Arc<AudioAppState>) {
+    if let Some(text) = ctx.text {
+        let mut full_res = app_state.full_response_text.lock().unwrap();
+        *full_res += &text;
+        *full_res += " ";
+        info!("[Handler] OpenAI Text: {}", text.trim());
+    }
+    if let Some(audio_samples) = ctx.audio {
+        if !audio_samples.is_empty() {
+            debug!("[Handler] OpenAI Audio: {} samples", audio_samples.len());
+            if let Err(e) = app_state.playback_sender.send(audio_samples) {
+                error!("[Handler] Failed to send audio for playback: {}", e);
+            }
+        }
+    }
+    if ctx.is_done {
+        info!("[Handler] OpenAI content segment processing complete.");
+        app_state.interaction_complete_signal.notify_one();
+    }
+}
+
+async fn handle_usage_metadata(_ctx: UsageMetadataContext, _app_state: Arc<AudioAppState>) {
+    info!("[Handler] OpenAI Usage Metadata: {:?}", _ctx.metadata);
+}
+
+fn find_supported_config_generic<F, I>(
+    mut configs_iterator_fn: F,
+    target_sample_rate: u32,
+    target_channels: u16,
+) -> Result<SupportedStreamConfig, anyhow::Error>
+where
+    F: FnMut() -> Result<I, cpal::SupportedStreamConfigsError>,
+    I: Iterator<Item = cpal::SupportedStreamConfigRange>,
+{
+    let mut best_config: Option<SupportedStreamConfig> = None;
+    let mut min_rate_diff = u32::MAX;
+
+    for config_range in configs_iterator_fn()? {
+        if config_range.channels() != target_channels {
+            continue;
+        }
+        if config_range.sample_format() != SampleFormat::I16 {
+            continue;
+        }
+
+        let current_min_rate = config_range.min_sample_rate().0;
+        let current_max_rate = config_range.max_sample_rate().0;
+        let rate_to_check =
+            if target_sample_rate >= current_min_rate && target_sample_rate <= current_max_rate {
+                target_sample_rate
+            } else if target_sample_rate < current_min_rate {
+                current_min_rate
+            } else {
+                current_max_rate
+            };
+        let rate_diff = (rate_to_check as i32 - target_sample_rate as i32).abs() as u32;
+        if best_config.is_none() || rate_diff < min_rate_diff {
+            min_rate_diff = rate_diff;
+            best_config = Some(config_range.with_sample_rate(SampleRate(rate_to_check)));
+        }
+        if rate_diff == 0 {
+            break;
+        }
+    }
+    best_config.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No i16 config for ~{}Hz {}ch",
+            target_sample_rate,
+            target_channels
+        )
+    })
+}
+
+fn setup_audio_input(
+    /* ... (unchanged) ... */
+    audio_chunk_sender: tokio::sync::mpsc::Sender<Vec<i16>>,
+    app_state: Arc<AudioAppState>,
+) -> Result<cpal::Stream, anyhow::Error> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("No input device"))?;
+    info!("[AudioInput] Using input: {}", device.name()?);
+    let supported_config = find_supported_config_generic(
+        || device.supported_input_configs(),
+        INPUT_SAMPLE_RATE_HZ,
+        INPUT_CHANNELS_COUNT,
+    )?;
+    let config: StreamConfig = supported_config.config();
+    info!("[AudioInput] Building stream with config: {:?}", config);
+
+    let stream = device.build_input_stream(
+        &config,
+        move |data: &[i16], _: &cpal::InputCallbackInfo| {
+            if !*app_state.capturing_audio.lock().unwrap() {
+                return;
+            }
+            if data.is_empty() {
+                return;
+            }
+            match audio_chunk_sender.try_send(data.to_vec()) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!("[AudioInput] Chunk channel full.")
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    error!("[AudioInput] Chunk channel closed.")
+                }
+            }
+        },
+        |err| error!("[AudioInput] CPAL Error: {}", err),
+        None,
+    )?;
+    stream.play()?;
+    info!("[AudioInput] Mic stream started with config: {:?}", config);
+    Ok(stream)
+}
+fn setup_audio_output(
+    playback_receiver: Receiver<Vec<i16>>,
+) -> Result<cpal::Stream, anyhow::Error> {
+    /* ... (unchanged) ... */
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("No output device"))?;
+    info!("[AudioOutput] Using output: {}", device.name()?);
+    let supported_config = find_supported_config_generic(
+        || device.supported_output_configs(),
+        OUTPUT_SAMPLE_RATE_HZ,
+        OUTPUT_CHANNELS_COUNT,
+    )?;
+    let config: StreamConfig = supported_config.config();
+    info!("[AudioOutput] Building stream with config: {:?}", config);
+    let mut samples_buffer: Vec<i16> = Vec::new();
+
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+            let mut written = 0;
+            while written < data.len() {
+                if samples_buffer.is_empty() {
+                    match playback_receiver.try_recv() {
+                        Ok(new_samples) => samples_buffer.extend(new_samples),
+                        Err(_) => break,
+                    }
+                }
+                if samples_buffer.is_empty() {
+                    break;
+                }
+                let to_write_now = std::cmp::min(data.len() - written, samples_buffer.len());
+                for i in 0..to_write_now {
+                    data[written + i] = samples_buffer.remove(0);
+                }
+                written += to_write_now;
+            }
+            for sample in data.iter_mut().skip(written) {
+                *sample = 0;
+            }
+            if written > 0 {
+                trace!("[AudioOutput] Played {} samples.", written);
+            }
+        },
+        |err| error!("[AudioOutput] CPAL Error: {}", err),
+        None,
+    )?;
+    stream.play()?;
+    info!(
+        "[AudioOutput] Playback stream started with config: {:?}",
+        config
+    );
+    Ok(stream)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    dotenv::dotenv().ok();
+
+    let api_key =
+        env::var("API_KEY").map_err(|_| "OPENAI_API_KEY not set (using API_KEY for now)")?;
+    let model_name = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+    info!("Using OpenAI Model: {}", model_name);
+
+    let (pb_sender, pb_receiver) = bounded::<Vec<i16>>(100);
+    let (audio_input_chunk_tx, mut audio_input_chunk_rx) =
+        tokio::sync::mpsc::channel::<Vec<i16>>(20);
+
+    let app_state_value = AudioAppState::default();
+    let app_state_for_callbacks = Arc::new(app_state_value.clone());
+
+    info!("Configuring Client for OpenAI Audio...");
+    let mut builder = GeminiLiveClientBuilder::<AudioAppState>::new_with_model_and_state(
+        api_key,
+        model_name,
+        app_state_value,
+    );
+
+    builder = builder.generation_config(GenerationConfig {
+        response_modalities: Some(vec![ResponseModality::Audio, ResponseModality::Text]), // OpenAI can do both
+        temperature: Some(0.7),
+        // speech_config is Gemini specific for output, OpenAI uses .voice()
+        ..Default::default()
+    });
+
+    builder = builder.voice("alloy".to_string()); // OpenAI specific voice
+    builder = builder.input_audio_format("pcm16".to_string());
+    builder = builder.output_audio_format("pcm16".to_string());
+    // No RealtimeInputConfig for OpenAI, VAD is handled differently
+
+    builder = builder.output_audio_transcription(AudioTranscriptionConfig {});
+    builder = builder.system_instruction(Content {
+        parts: vec![Part {
+            text: Some("You are an OpenAI voice assistant. Respond to my audio.".to_string()),
+            ..Default::default()
+        }],
+        role: Some(Role::System),
+        ..Default::default()
+    });
+    builder = builder.on_server_content(handle_on_content);
+    builder = builder.on_usage_metadata(handle_usage_metadata);
+
+    info!("Connecting OpenAI client...");
+    let client = builder.connect_openai().await?; // Use connect_openai
+    let client_arc = Arc::new(tokio::sync::Mutex::new(client));
+
+    let _input_stream = setup_audio_input(
+        audio_input_chunk_tx.clone(),
+        app_state_for_callbacks.clone(),
+    )?;
+    let _output_stream = setup_audio_output(pb_receiver)?;
+
+    info!(
+        "OpenAI Client connected. Will send audio for ~3 seconds, then send audio_stream_end and request response."
+    );
+    *app_state_for_callbacks.capturing_audio.lock().unwrap() = true;
+    info!("Microphone capturing enabled. Sending audio for ~3 seconds...");
+
+    let audio_duration = Duration::from_secs(3);
+    let start_time = tokio::time::Instant::now();
+    while start_time.elapsed() < audio_duration {
+        if let Some(samples) = audio_input_chunk_rx.recv().await {
+            let mut client_guard = client_arc.lock().await;
+            if let Err(e) = client_guard
+                .send_audio_chunk(&samples, INPUT_SAMPLE_RATE_HZ)
+                .await
+            {
+                error!("Failed to send audio chunk: {:?}", e);
+                if matches!(
+                    e,
+                    gemini_live_api::error::GeminiError::SendError
+                        | gemini_live_api::error::GeminiError::ConnectionClosed
+                ) {
+                    break;
+                }
+            }
+        } else {
+            info!("Audio input channel closed.");
+            break;
+        }
+    }
+
+    info!("Stopping microphone capture.");
+    *app_state_for_callbacks.capturing_audio.lock().unwrap() = false;
+    drop(audio_input_chunk_tx);
+
+    {
+        let mut client_guard = client_arc.lock().await;
+        info!("Sending audioStreamEnd to OpenAI...");
+        if let Err(e) = client_guard.send_audio_stream_end().await {
+            error!("Failed to send audioStreamEnd: {:?}", e);
+        }
+        info!("Requesting final response from OpenAI...");
+        if let Err(e) = client_guard.request_response().await {
+            error!("Failed to request final response: {:?}", e);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let interaction_complete_notification =
+        app_state_for_callbacks.interaction_complete_signal.clone();
+    let main_loop_duration = Duration::from_secs(30); // Increased timeout
+
+    info!("Waiting for OpenAI server response or timeout...");
+    tokio::select! {
+        _ = interaction_complete_notification.notified() => {
+            let final_text = app_state_for_callbacks.full_response_text.lock().unwrap().trim().to_string();
+            info!("\n--- OPENAI INTERACTION COMPLETE. Final Text: {} ---", final_text);
+        }
+        _ = tokio::signal::ctrl_c() => { info!("Ctrl+C received, initiating shutdown."); }
+        res = tokio::time::timeout(main_loop_duration, async { loop { tokio::task::yield_now().await; }}) => {
+            if res.is_err() { warn!("Interaction timed out after {} seconds.", main_loop_duration.as_secs()); }
+        }
+    }
+
+    info!("Shutting down OpenAI client...");
+    client_arc.lock().await.close().await?;
+    info!("OpenAI Client closed.");
+    Ok(())
+}
+--- examples/common.rs ---
+// examples/common.rs (if you create this file)
+use gemini_live_api::ApiProvider;
+use std::env;
+
+pub fn get_api_key_and_provider() -> Result<(String, String, ApiProvider), String> {
+    dotenvy::dotenv().ok(); // Use dotenvy
+
+    let api_key = env::var("API_KEY")
+        .map_err(|_| "API_KEY not set. Please set for Gemini or OpenAI.".to_string())?;
+
+    let provider_str = env::var("API_PROVIDER").unwrap_or_else(|_| "gemini".to_string());
+
+    let (provider, default_model) = match provider_str.to_lowercase().as_str() {
+        "gemini" => (
+            ApiProvider::Gemini,
+            "models/gemini-1.5-flash-latest".to_string(),
+        ),
+        "openai" => (ApiProvider::OpenAi, "gpt-4o".to_string()), // Use a known OpenAI model
+        _ => {
+            return Err(format!(
+                "Unsupported API_PROVIDER: {}. Choose 'gemini' or 'openai'.",
+                provider_str
+            ));
+        }
+    };
+
+    let model_env_key = match provider {
+        ApiProvider::Gemini => "GEMINI_MODEL",
+        ApiProvider::OpenAi => "OPENAI_MODEL",
+    };
+    let model_name = env::var(model_env_key).unwrap_or(default_model);
+
+    Ok((api_key, model_name, provider))
+}
+--- examples/continuous_audio_chat.rs ---
+use cpal::{
+    BufferSize, SampleFormat, SampleRate, StreamConfig, SupportedStreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
+use crossbeam_channel::{Receiver, Sender, bounded};
+use gemini_live_api::{
+    AiClientBuilder, // Using AiClientBuilder
+    client::{ServerContentContext, UsageMetadataContext}, // Using AiLiveClient
+    types::*,
+};
+use std::{
+    collections::VecDeque, // <<< ADDED VecDeque
+    env,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
+use tokio::sync::Notify;
+use tracing::{error, info, trace, warn};
+
+#[derive(Clone, Debug)]
+struct ContinuousAudioAppState {
+    full_response_text: Arc<StdMutex<String>>,
+    model_turn_complete_signal: Arc<Notify>,
+    playback_sender: Arc<Sender<Vec<i16>>>,
+    is_microphone_active: Arc<StdMutex<bool>>,
+    user_speech_ended_signal: Arc<Notify>,
+}
+
+impl Default for ContinuousAudioAppState {
+    fn default() -> Self {
+        let (pb_sender, _) = bounded(100);
+        ContinuousAudioAppState {
+            full_response_text: Arc::new(StdMutex::new(String::new())),
+            model_turn_complete_signal: Arc::new(Notify::new()),
+            playback_sender: Arc::new(pb_sender),
+            is_microphone_active: Arc::new(StdMutex::new(false)),
+            user_speech_ended_signal: Arc::new(Notify::new()),
+        }
+    }
+}
+
+const INPUT_SAMPLE_RATE_HZ: u32 = 16000;
+const INPUT_CHANNELS_COUNT: u16 = 1;
+const OUTPUT_SAMPLE_RATE_HZ: u32 = 24000;
+const OUTPUT_CHANNELS_COUNT: u16 = 1;
+
+async fn handle_on_content(ctx: ServerContentContext, app_state: Arc<ContinuousAudioAppState>) {
+    if let Some(text) = ctx.text {
+        let mut full_res = app_state.full_response_text.lock().unwrap();
+        *full_res += &text;
+        *full_res += " ";
+        info!("[Handler] OpenAI Text: {}", text.trim());
+    }
+    if let Some(audio_samples) = ctx.audio {
+        if !audio_samples.is_empty() {
+            // info!("[Handler] OpenAI Audio: {} samples. Attempting playback.", audio_samples.len());
+            match app_state.playback_sender.try_send(audio_samples) {
+                Ok(_) => { /* Sent */ }
+                Err(crossbeam_channel::TrySendError::Full(s)) => {
+                    warn!(
+                        "[Handler] Playback channel full, dropping {} audio samples.",
+                        s.len()
+                    );
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    error!("[Handler] Playback channel DISCONNECTED when trying to send.");
+                }
+            }
+        }
+    }
+    if ctx.is_done {
+        info!("[Handler] OpenAI content segment complete (is_done=true).");
+        app_state.model_turn_complete_signal.notify_one();
+    }
+}
+
+async fn handle_usage_metadata(
+    _ctx: UsageMetadataContext,
+    _app_state: Arc<ContinuousAudioAppState>,
+) {
+    info!("[Handler] OpenAI Usage Metadata: {:?}", _ctx.metadata);
+}
+
+fn find_supported_config_generic<F, I>(
+    mut configs_iterator_fn: F,
+    target_sample_rate: u32,
+    target_channels: u16,
+) -> Result<SupportedStreamConfig, anyhow::Error>
+where
+    F: FnMut() -> Result<I, cpal::SupportedStreamConfigsError>,
+    I: Iterator<Item = cpal::SupportedStreamConfigRange>,
+{
+    let mut best_config: Option<SupportedStreamConfig> = None;
+    let mut min_rate_diff = u32::MAX;
+
+    for config_range in configs_iterator_fn()? {
+        if config_range.channels() != target_channels {
+            continue;
+        }
+        if config_range.sample_format() != SampleFormat::I16 {
+            continue;
+        }
+
+        let current_min_rate = config_range.min_sample_rate().0;
+        let current_max_rate = config_range.max_sample_rate().0;
+        let rate_to_check =
+            if target_sample_rate >= current_min_rate && target_sample_rate <= current_max_rate {
+                target_sample_rate
+            } else if target_sample_rate < current_min_rate {
+                current_min_rate
+            } else {
+                current_max_rate
+            };
+        let rate_diff = (rate_to_check as i32 - target_sample_rate as i32).abs() as u32;
+        if best_config.is_none() || rate_diff < min_rate_diff {
+            min_rate_diff = rate_diff;
+            best_config = Some(config_range.with_sample_rate(SampleRate(rate_to_check)));
+        }
+        if rate_diff == 0 {
+            break;
+        }
+    }
+    best_config.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No i16 config for ~{}Hz {}ch",
+            target_sample_rate,
+            target_channels
+        )
+    })
+}
+
+fn setup_audio_input(
+    audio_chunk_sender: tokio::sync::mpsc::Sender<Vec<i16>>,
+    app_state: Arc<ContinuousAudioAppState>,
+) -> Result<cpal::Stream, anyhow::Error> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("No input device"))?;
+    info!("[AudioInput] Using input: {}", device.name()?);
+    let supported_config = find_supported_config_generic(
+        || device.supported_input_configs(),
+        INPUT_SAMPLE_RATE_HZ,
+        INPUT_CHANNELS_COUNT,
+    )?;
+    let config: StreamConfig = supported_config.config(); // Make mutable for buffer_size
+    info!("[AudioInput] Initial supported config: {:?}", config);
+
+    let stream = device.build_input_stream(
+        &config,
+        move |data: &[i16], _: &cpal::InputCallbackInfo| {
+            if !*app_state.is_microphone_active.lock().unwrap() {
+                return;
+            }
+            if data.is_empty() {
+                return;
+            }
+            match audio_chunk_sender.try_send(data.to_vec()) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!("[AudioInput] Chunk channel full.")
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    info!("[AudioInput] Chunk channel closed (expected on shutdown).")
+                }
+            }
+        },
+        |err| error!("[AudioInput] CPAL Error: {}", err),
+        None,
+    )?;
+    stream.play()?;
+    info!(
+        "[AudioInput] Mic stream started with actual config: {:?}",
+        config
+    );
+    Ok(stream)
+}
+
+fn setup_audio_output(
+    playback_receiver: Receiver<Vec<i16>>,
+) -> Result<cpal::Stream, anyhow::Error> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("No output device"))?;
+    info!("[AudioOutput] Using output device: {}", device.name()?);
+
+    let supported_config_range = find_supported_config_generic(
+        || device.supported_output_configs(),
+        OUTPUT_SAMPLE_RATE_HZ,
+        OUTPUT_CHANNELS_COUNT,
+    )?;
+
+    let mut config: StreamConfig = supported_config_range.config();
+    let latency_ms = 100.0;
+    let frames = (latency_ms / 1_000.0) * config.sample_rate.0 as f32;
+    config.buffer_size = BufferSize::Fixed(frames.round() as u32);
+
+    info!(
+        "[AudioOutput] Final attempt to build stream with config: {:?}",
+        config
+    );
+
+    // <<< MODIFIED: Use VecDeque for efficient front removal
+    let mut internal_samples_buffer: VecDeque<i16> = VecDeque::new();
+    let mut callback_invocation_count: u64 = 0;
+
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [i16], _cb_info: &cpal::OutputCallbackInfo| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                callback_invocation_count += 1;
+                // You can re-enable this trace for detailed debugging:
+                // trace!("[AudioOutputCallback #{}] Called. Data len: {}, Info: {:?}", callback_invocation_count, data.len(), cb_info);
+
+                let mut cpal_buffer_filled_count = 0;
+                let cpal_buffer_len = data.len();
+
+                while cpal_buffer_filled_count < cpal_buffer_len {
+                    if internal_samples_buffer.is_empty() {
+                        match playback_receiver.try_recv() {
+                            Ok(new_api_chunk) => {
+                                internal_samples_buffer.extend(new_api_chunk);
+                            }
+                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                                break;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                // Channel is disconnected. Fill remaining buffer with silence and return.
+                                // The stream should continue playing silence.
+                                // The error will be logged by the sender side in handle_on_content.
+                                for sample_ref in data.iter_mut().skip(cpal_buffer_filled_count) {
+                                    *sample_ref = 0;
+                                }
+                                trace!("[AudioOutputCallback] Playback channel disconnected. Filling with silence.");
+                                return; 
+                            }
+                        }
+                    }
+                    if internal_samples_buffer.is_empty() { // Check again after potential extend
+                        break;
+                    }
+
+                    let available_in_internal_buffer = internal_samples_buffer.len();
+                    let needed_for_cpal_data_slice = cpal_buffer_len - cpal_buffer_filled_count;
+                    let num_to_copy_now =
+                        std::cmp::min(available_in_internal_buffer, needed_for_cpal_data_slice);
+
+                    if num_to_copy_now > 0 {
+                        for i in 0..num_to_copy_now {
+                            // <<< MODIFIED: Use pop_front() which is O(1)
+                            if let Some(sample) = internal_samples_buffer.pop_front() {
+                                data[cpal_buffer_filled_count + i] = sample;
+                            } else {
+                                // Should not happen due to `num_to_copy_now` logic and prior is_empty checks
+                                data[cpal_buffer_filled_count + i] = 0; // Fallback to silence
+                                error!("[AudioOutputCallback] Unexpected empty internal_samples_buffer during copy!");
+                            }
+                        }
+                        cpal_buffer_filled_count += num_to_copy_now;
+                    } else {
+                        // This case (num_to_copy_now == 0) should be caught by internal_samples_buffer.is_empty()
+                        break; 
+                    }
+                }
+                // Fill any remaining part of the CPAL buffer with silence
+                if cpal_buffer_filled_count < cpal_buffer_len {
+                    for sample_ref in data.iter_mut().skip(cpal_buffer_filled_count) {
+                        *sample_ref = 0;
+                    }
+                }
+            }));
+
+            if let Err(panic_payload) = result {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                    *s
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.as_str()
+                } else {
+                    "Unknown panic payload"
+                };
+                error!(
+                    "[AudioOutputCallback] !!! PANIC CAUGHT IN AUDIO CALLBACK !!! Payload: {}",
+                    msg
+                );
+                // Fill entire buffer with silence, as the stream state is unknown after panic
+                for sample_ref in data.iter_mut() {
+                    *sample_ref = 0;
+                }
+            }
+        },
+        move |err| {
+            // This is a critical log. If this appears, CPAL itself has an issue with the stream.
+            error!("[AudioOutput] CPAL STREAM ERROR REPORTED: {:?}", err);
+        },
+        None,
+    )?;
+
+    stream.play()?;
+    info!("[AudioOutput] Playback stream successfully started (with VecDeque and catch_unwind).");
+    Ok(stream)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    dotenv::dotenv().ok();
+
+    let api_key = env::var("API_KEY").map_err(|_| "API_KEY for OpenAI not set")?;
+    let model_name =
+        env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini-realtime-preview".to_string());
+    info!("Using OpenAI Model: {}", model_name);
+
+    let (playback_tx, playback_rx) = bounded::<Vec<i16>>(200); // Main playback channel
+    let (audio_input_chunk_tx, mut audio_input_chunk_rx) =
+        tokio::sync::mpsc::channel::<Vec<i16>>(50);
+
+    let app_state_value = ContinuousAudioAppState {
+        // Ensure the main playback_tx is used here
+        playback_sender: Arc::new(playback_tx),
+        ..Default::default()
+    };
+    let app_state_for_local_use = Arc::new(app_state_value.clone());
+
+    let mut builder = AiClientBuilder::<ContinuousAudioAppState>::new_with_model_and_state(
+        api_key,
+        model_name.clone(),
+        app_state_value, // Pass S value to builder
+    );
+
+    builder = builder.generation_config(GenerationConfig {
+        response_modalities: Some(vec![ResponseModality::Audio, ResponseModality::Text]),
+        temperature: Some(0.7),
+        ..Default::default()
+    });
+    builder = builder.voice("alloy".to_string());
+    builder = builder.input_audio_format("pcm16".to_string());
+    builder = builder.output_audio_format("pcm16".to_string());
+    builder = builder.output_audio_transcription(AudioTranscriptionConfig {});
+    builder = builder.system_instruction(Content {
+        parts: vec![Part {
+            text: Some("You are a helpful OpenAI voice assistant.".to_string()),
+            ..Default::default()
+        }],
+        role: Some(Role::System),
+        ..Default::default()
+    });
+    builder = builder.on_server_content(move |ctx, state_arc| handle_on_content(ctx, state_arc));
+    builder =
+        builder.on_usage_metadata(move |ctx, state_arc| handle_usage_metadata(ctx, state_arc));
+
+    info!("Connecting OpenAI client...");
+    let client_result = builder.connect_openai().await; 
+
+    // ***** TEMPORARY TEST: START AUDIO OUTPUT AND WAIT *****
+    info!("[DEBUG] Setting up audio output ONLY for test.");
+    let (pb_tx_test, pb_rx_test) = bounded::<Vec<i16>>(10);
+    let output_stream_test_keepalive = match setup_audio_output(pb_rx_test) { // Use the setup_audio_output
+        Ok(s) => {
+            info!("[DEBUG] Test output stream started. Main thread will sleep for 10s.");
+            s // Keep the stream object alive
+        }
+        Err(e) => {
+            error!("[DEBUG] Failed to setup test output stream: {:?}", e);
+            return Err(e.into());
+        }
+    };
+
+    // Keep pb_tx_test alive for the duration of the spawned task by moving it
+    let test_sender_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        info!("[DEBUG_SENDER] Attempting to send dummy silence to test playback channel.");
+        if let Err(e) = pb_tx_test.try_send(vec![0; 2400]) { 
+            error!("[DEBUG_SENDER] Failed to send dummy silence: {}", e); 
+        } else {
+            info!("[DEBUG_SENDER] Successfully sent dummy silence.");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        info!("[DEBUG_SENDER] Attempting to send dummy silence AGAIN to test playback channel.");
+        if let Err(e) = pb_tx_test.try_send(vec![0; 2400]) {
+            error!(
+                "[DEBUG_SENDER] Failed to send dummy silence (2nd attempt): {}",
+                e
+            );
+        } else {
+            info!("[DEBUG_SENDER] Successfully sent dummy silence (2nd attempt).");
+        }
+        // pb_tx_test is dropped when this task finishes
+    });
+
+    tokio::time::sleep(Duration::from_secs(10)).await; 
+    info!(
+        "[DEBUG] Finished 10s sleep. If no CPAL errors or sender disconnects, output stream was stable."
+    );
+    
+    // Explicitly drop the test stream and wait for the sender task to ensure its sender is dropped
+    // before proceeding or if you were to exit here.
+    drop(output_stream_test_keepalive); 
+    let _ = test_sender_task.await; // Wait for the sender task to complete
+    info!("[DEBUG] Test audio output resources cleaned up.");
+    
+    // If you want to exit after the test:
+    // return Ok(()); 
+    // ***** END TEMPORARY TEST *****
+
+
+    // Proceed with the actual client and streams
+    let client = client_result?; // Handle error from client connection
+    let client_arc = Arc::new(tokio::sync::Mutex::new(client));
+
+    info!("Setting up main audio input and output streams...");
+    let _input_stream = setup_audio_input(
+        audio_input_chunk_tx.clone(), 
+        app_state_for_local_use.clone()
+    )?;
+    // Use the main playback_rx for the actual application output stream
+    let _output_stream = setup_audio_output(playback_rx)?; 
+
+    *app_state_for_local_use.is_microphone_active.lock().unwrap() = true;
+    info!("Microphone active. Continuous OpenAI audio chat. Press Ctrl+C to exit.");
+    
+    // Main application loop
+    let audio_processing_task_client = client_arc.clone();
+    let audio_processing_task_state = app_state_for_local_use.clone();
+    let audio_processing_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased; // Prioritize shutdown/user speech end signals
+                _ = audio_processing_task_state.user_speech_ended_signal.notified() => {
+                    info!("[AudioProcessingTask] User speech ended signal. Sending audioStreamEnd and requesting response.");
+                    let client_guard = audio_processing_task_client.lock().await;
+                    if let Err(e) = client_guard.send_audio_stream_end().await {
+                        error!("[AudioProcessingTask] Failed to send audioStreamEnd: {:?}", e);
+                    }
+                    // For continuous chat, OpenAI might not need explicit request_response after every user utterance end
+                    // if VAD is handled by server or if stream is kept open for model to interject.
+                    // However, for explicit turns, this is correct.
+                    // if let Err(e) = client_guard.request_response().await {
+                    //     error!("[AudioProcessingTask] Failed to request final response: {:?}", e);
+                    // }
+                    *audio_processing_task_state.is_microphone_active.lock().unwrap() = false; // Pause mic until model responds
+                }
+                maybe_samples = audio_input_chunk_rx.recv() => {
+                    if let Some(samples) = maybe_samples {
+                        if *audio_processing_task_state.is_microphone_active.lock().unwrap() && !samples.is_empty() {
+                            let client_guard = audio_processing_task_client.lock().await;
+                            if let Err(e) = client_guard.send_audio_chunk(&samples, INPUT_SAMPLE_RATE_HZ).await {
+                                error!("[AudioProcessingTask] Failed to send audio chunk: {:?}", e);
+                                if matches!(e, gemini_live_api::error::GeminiError::SendError | gemini_live_api::error::GeminiError::ConnectionClosed) {
+                                    break; // Exit task if connection is truly gone
+                                }
+                            }
+                        }
+                    } else {
+                        info!("[AudioProcessingTask] Audio input channel closed. Exiting task.");
+                        break; // Exit task
+                    }
+                }
+            }
+        }
+        info!("[AudioProcessingTask] Stopped.");
+    });
+
+    loop {
+        tokio::select! {
+            _ = app_state_for_local_use.model_turn_complete_signal.notified() => {
+                info!("[MainLoop] Model turn complete. Clearing response text & re-activating mic (if desired).");
+                app_state_for_local_use.full_response_text.lock().unwrap().clear();
+                 // Re-enable microphone for the user's next turn after model finishes
+                *app_state_for_local_use.is_microphone_active.lock().unwrap() = true;
+                info!("[MainLoop] Microphone re-activated for user input.");
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl+C received. Shutting down...");
+                break;
+            }
+        }
+    }
+    
+    info!("Exited main loop. Cleaning up...");
+    *app_state_for_local_use.is_microphone_active.lock().unwrap() = false;
+    app_state_for_local_use.user_speech_ended_signal.notify_waiters(); // Signal any pending VAD
+    drop(audio_input_chunk_tx); // Close audio input channel
+
+    // Wait for audio processing task to finish
+    if let Err(e) = audio_processing_task.await {
+        error!("Audio processing task panicked or encountered an error: {:?}", e);
+    }
+
+    client_arc.lock().await.close().await?;
+    info!("OpenAI Client closed. Exiting application.");
+
+    Ok(())
+}
+--- examples/continuous_audio_with_tools.rs ---
+// examples/continuous_audio_with_tools.rs
+use cpal::{
+    BufferSize, 
+    SampleFormat, SampleRate, StreamConfig, SupportedStreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
+use crossbeam_channel::{Receiver, Sender, bounded};
+use gemini_live_api::{
+    AiClientBuilder, 
+    client::{ServerContentContext, UsageMetadataContext}, 
+    tool_function, // This is the macro we are using
+    types::*,
+};
+use std::{
+    collections::VecDeque, 
+    env,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{Mutex as TokioMutex, Notify};
+use tracing::{error, info, trace, warn}; // Removed 'debug'
+
+#[derive(Clone, Debug)]
+struct AudioToolAppState {
+    model_response_text: Arc<TokioMutex<String>>,
+    model_turn_complete_signal: Arc<Notify>,
+    playback_sender: Arc<Sender<Vec<i16>>>,
+    is_microphone_active: Arc<TokioMutex<bool>>,
+    tool_call_count: Arc<TokioMutex<u32>>,
+    is_tool_running: Arc<TokioMutex<bool>>,
+    user_speech_ended_signal: Arc<Notify>, 
+}
+
+impl AudioToolAppState {
+    fn new(playback_sender: Sender<Vec<i16>>) -> Self {
+        Self {
+            model_response_text: Arc::new(TokioMutex::new(String::new())),
+            model_turn_complete_signal: Arc::new(Notify::new()),
+            playback_sender: Arc::new(playback_sender),
+            is_microphone_active: Arc::new(TokioMutex::new(false)),
+            tool_call_count: Arc::new(TokioMutex::new(0)),
+            is_tool_running: Arc::new(TokioMutex::new(false)),
+            user_speech_ended_signal: Arc::new(Notify::new()),
+        }
+    }
+}
+
+const INPUT_SAMPLE_RATE_HZ: u32 = 16000;
+const INPUT_CHANNELS_COUNT: u16 = 1;
+const OUTPUT_SAMPLE_RATE_HZ: u32 = 24000;
+const OUTPUT_CHANNELS_COUNT: u16 = 1;
+
+/// This tool calculates the sum of two numbers.
+#[tool_function] // Can also be #[tool_function("Calculates the sum of two numbers")]
+async fn sum_tool(state: Arc<AudioToolAppState>, a: f64, b: f64) -> String {
+    *state.is_tool_running.lock().await = true;
+    let mut count_guard = state.tool_call_count.lock().await;
+    *count_guard += 1;
+    info!(
+        "[Tool] sum_tool called (count {}). Args: a={}, b={}",
+        *count_guard, a, b
+    );
+    drop(count_guard);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let result = a + b;
+    info!("[Tool] sum_tool result: {}", result);
+    *state.is_tool_running.lock().await = false;
+    format!("The sum is: {result}")
+}
+
+/// This tool gets the current time.
+#[tool_function] // Can also be #[tool_function("Provides the current time")]
+async fn get_current_time_tool(state: Arc<AudioToolAppState>) -> String {
+    *state.is_tool_running.lock().await = true;
+    let mut count_guard = state.tool_call_count.lock().await;
+    *count_guard += 1;
+    info!(
+        "[Tool] get_current_time_tool called (count {})",
+        *count_guard
+    );
+    drop(count_guard);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let now = chrono::Local::now();
+    let time_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    info!("[Tool] get_current_time_tool result: {}", time_str);
+    *state.is_tool_running.lock().await = false;
+    time_str
+}
+
+async fn handle_on_content(ctx: ServerContentContext, app_state: Arc<AudioToolAppState>) {
+    if let Some(text) = ctx.text {
+        let mut model_text_guard = app_state.model_response_text.lock().await;
+        *model_text_guard += &text;
+        *model_text_guard += " ";
+        info!("[Handler] OpenAI Model Text: {}", text.trim());
+    }
+    if let Some(audio_samples) = ctx.audio {
+        if !audio_samples.is_empty() {
+            match app_state.playback_sender.try_send(audio_samples) {
+                Ok(_) => { /* Sent */ }
+                Err(crossbeam_channel::TrySendError::Full(s)) => {
+                    warn!(
+                        "[Handler] Playback channel full, dropping {} audio samples.",
+                        s.len()
+                    );
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    error!("[Handler] Playback channel DISCONNECTED when trying to send audio for playback.");
+                }
+            }
+        }
+    }
+    if ctx.is_done {
+        info!("[Handler] OpenAI Content segment done (is_done=true).");
+        app_state.model_turn_complete_signal.notify_one();
+    }
+}
+async fn handle_usage_metadata(_ctx: UsageMetadataContext, app_state: Arc<AudioToolAppState>) {
+    let tool_calls = *app_state.tool_call_count.lock().await;
+    info!(
+        "[Handler] OpenAI Usage Metadata: {:?}, Tool Calls: {}",
+        _ctx.metadata, tool_calls
+    );
+}
+fn find_supported_config_generic<F, I>(
+    mut configs_iterator_fn: F,
+    target_sample_rate: u32,
+    target_channels: u16,
+) -> Result<SupportedStreamConfig, anyhow::Error>
+where
+    F: FnMut() -> Result<I, cpal::SupportedStreamConfigsError>,
+    I: Iterator<Item = cpal::SupportedStreamConfigRange>,
+{
+    let mut best_config: Option<SupportedStreamConfig> = None;
+    let mut min_rate_diff = u32::MAX;
+
+    for config_range in configs_iterator_fn()? {
+        if config_range.channels() != target_channels {
+            continue;
+        }
+        if config_range.sample_format() != SampleFormat::I16 {
+            continue;
+        }
+
+        let current_min_rate = config_range.min_sample_rate().0;
+        let current_max_rate = config_range.max_sample_rate().0;
+        let rate_to_check =
+            if target_sample_rate >= current_min_rate && target_sample_rate <= current_max_rate {
+                target_sample_rate
+            } else if target_sample_rate < current_min_rate {
+                current_min_rate
+            } else {
+                current_max_rate
+            };
+        let rate_diff = (rate_to_check as i32 - target_sample_rate as i32).abs() as u32;
+        if best_config.is_none() || rate_diff < min_rate_diff {
+            min_rate_diff = rate_diff;
+            best_config = Some(config_range.with_sample_rate(SampleRate(rate_to_check)));
+        }
+        if rate_diff == 0 {
+            break;
+        }
+    }
+    best_config.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No i16 config for ~{}Hz {}ch",
+            target_sample_rate,
+            target_channels
+        )
+    })
+}
+fn setup_audio_input(
+    audio_chunk_sender: tokio::sync::mpsc::Sender<Vec<i16>>,
+    app_state: Arc<AudioToolAppState>,
+) -> Result<cpal::Stream, anyhow::Error> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("No input device"))?;
+    info!("[AudioInput] Using input: {}", device.name()?);
+    let supported_config = find_supported_config_generic(
+        || device.supported_input_configs(),
+        INPUT_SAMPLE_RATE_HZ,
+        INPUT_CHANNELS_COUNT,
+    )?;
+    let config: StreamConfig = supported_config.config();
+    info!("[AudioInput] Building stream with config: {:?}", config);
+    
+    let stream = device.build_input_stream(
+        &config,
+        move |data: &[i16], _: &cpal::InputCallbackInfo| {
+            let mic_active = app_state.is_microphone_active.blocking_lock();
+            if !*mic_active { 
+                return;
+            }
+            drop(mic_active); 
+            
+            let tool_running = app_state.is_tool_running.blocking_lock();
+            if *tool_running { 
+                return;
+            }
+            drop(tool_running);
+
+            if data.is_empty() {
+                return;
+            }
+            
+            match audio_chunk_sender.try_send(data.to_vec()) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!("[AudioInput] Chunk channel full.")
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    info!("[AudioInput] Chunk channel closed (expected on shutdown).")
+                }
+            }
+        },
+        |err| error!("[AudioInput] CPAL Error: {}", err),
+        None,
+    )?;
+    stream.play()?;
+    info!("[AudioInput] Mic stream started with config: {:?}", config);
+    Ok(stream)
+}
+
+fn setup_audio_output(
+    playback_receiver: Receiver<Vec<i16>>,
+) -> Result<cpal::Stream, anyhow::Error> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("No output device"))?;
+    info!("[AudioOutput] Using output device: {}", device.name()?);
+
+    let supported_config_range = find_supported_config_generic(
+        || device.supported_output_configs(),
+        OUTPUT_SAMPLE_RATE_HZ,
+        OUTPUT_CHANNELS_COUNT,
+    )?;
+
+    let mut config: StreamConfig = supported_config_range.config();
+    let latency_ms = 100.0; 
+    let frames = (latency_ms / 1_000.0) * config.sample_rate.0 as f32;
+    config.buffer_size = BufferSize::Fixed(frames.round() as u32);
+
+    info!(
+        "[AudioOutput] Final attempt to build stream with config: {:?}",
+        config
+    );
+
+    let mut internal_samples_buffer: VecDeque<i16> = VecDeque::new();
+    let mut callback_invocation_count: u64 = 0;
+
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [i16], _cb_info: &cpal::OutputCallbackInfo| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                callback_invocation_count += 1;
+                let mut cpal_buffer_filled_count = 0;
+                let cpal_buffer_len = data.len();
+
+                while cpal_buffer_filled_count < cpal_buffer_len {
+                    if internal_samples_buffer.is_empty() {
+                        match playback_receiver.try_recv() {
+                            Ok(new_api_chunk) => {
+                                internal_samples_buffer.extend(new_api_chunk);
+                            }
+                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                                break; 
+                            }
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                for sample_ref in data.iter_mut().skip(cpal_buffer_filled_count) {
+                                    *sample_ref = 0;
+                                }
+                                trace!("[AudioOutputCallback] Playback channel disconnected. Filling with silence.");
+                                return; 
+                            }
+                        }
+                    }
+                    if internal_samples_buffer.is_empty() {
+                        break;
+                    }
+
+                    let available_in_internal_buffer = internal_samples_buffer.len();
+                    let needed_for_cpal_data_slice = cpal_buffer_len - cpal_buffer_filled_count;
+                    let num_to_copy_now =
+                        std::cmp::min(available_in_internal_buffer, needed_for_cpal_data_slice);
+
+                    if num_to_copy_now > 0 {
+                        for i in 0..num_to_copy_now {
+                            if let Some(sample) = internal_samples_buffer.pop_front() {
+                                data[cpal_buffer_filled_count + i] = sample;
+                            } else {
+                                data[cpal_buffer_filled_count + i] = 0;
+                                error!("[AudioOutputCallback] Unexpected empty internal_samples_buffer during copy!");
+                            }
+                        }
+                        cpal_buffer_filled_count += num_to_copy_now;
+                    } else {
+                        break; 
+                    }
+                }
+                if cpal_buffer_filled_count < cpal_buffer_len {
+                    for sample_ref in data.iter_mut().skip(cpal_buffer_filled_count) {
+                        *sample_ref = 0;
+                    }
+                }
+            }));
+
+            if let Err(panic_payload) = result {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                    *s
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.as_str()
+                } else {
+                    "Unknown panic payload"
+                };
+                error!(
+                    "[AudioOutputCallback] !!! PANIC CAUGHT IN AUDIO CALLBACK !!! Payload: {}",
+                    msg
+                );
+                for sample_ref in data.iter_mut() {
+                    *sample_ref = 0;
+                }
+            }
+        },
+        move |err| {
+            error!("[AudioOutput] CPAL STREAM ERROR REPORTED: {:?}", err);
+        },
+        None,
+    )?;
+
+    stream.play()?;
+    info!("[AudioOutput] Playback stream successfully started (with VecDeque and catch_unwind).");
+    Ok(stream)
+}
+
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    dotenv::dotenv().ok();
+
+    let api_key = env::var("API_KEY").map_err(|_| "API_KEY for OpenAI not set")?;
+    let model_name =
+        env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini-realtime-preview".to_string());
+    info!("Using OpenAI Model for Tools: {}", model_name);
+
+    let (playback_tx, playback_rx) = bounded::<Vec<i16>>(200); 
+    let (audio_input_chunk_tx, mut audio_input_chunk_rx) =
+        tokio::sync::mpsc::channel::<Vec<i16>>(50);
+
+    let app_state_value = AudioToolAppState::new(playback_tx.clone());
+    let app_state_for_main = Arc::new(app_state_value.clone()); 
+
+    let mut builder = AiClientBuilder::<AudioToolAppState>::new_with_model_and_state( 
+        api_key,
+        model_name.clone(),
+        app_state_value, 
+    );
+
+    builder = builder.generation_config(GenerationConfig {
+        response_modalities: Some(vec![ResponseModality::Audio, ResponseModality::Text]),
+        temperature: Some(0.7),
+        ..Default::default()
+    });
+    builder = builder.voice("alloy".to_string());
+    builder = builder.input_audio_format("pcm16".to_string());
+    builder = builder.output_audio_format("pcm16".to_string());
+
+    builder = builder.output_audio_transcription(AudioTranscriptionConfig {});
+    builder = builder.system_instruction(Content {
+        parts: vec![Part {
+            text: Some(
+                "You are a voice assistant that can use tools. Respond verbally.".to_string(),
+            ),
+            ..Default::default()
+        }],
+        role: Some(Role::System),
+        ..Default::default()
+    });
+
+    // These functions are now pub and correctly generated by the macro
+    builder = sum_tool_register_tool(builder);
+    builder = get_current_time_tool_register_tool(builder);
+    
+    builder = builder.on_server_content(move |ctx, state_arc| handle_on_content(ctx, state_arc));
+    builder = builder.on_usage_metadata(move |ctx, state_arc| handle_usage_metadata(ctx, state_arc));
+
+
+    info!("Connecting OpenAI client for audio + tools: {}", model_name);
+    let client = builder.connect_openai().await?;
+    let client_arc = Arc::new(tokio::sync::Mutex::new(client));
+
+    let audio_task_client_clone = client_arc.clone();
+    let audio_task_app_state_clone = app_state_for_main.clone(); 
+
+    tokio::spawn(async move {
+        info!("[AudioProcessingTask] Started for OpenAI.");
+        loop {
+            let is_mic_active = *audio_task_app_state_clone.is_microphone_active.lock().await;
+            let is_tool_running = *audio_task_app_state_clone.is_tool_running.lock().await;
+
+            tokio::select! {
+                biased; // Prioritize explicit signals over continuous audio processing
+                _ = audio_task_app_state_clone.user_speech_ended_signal.notified(), if is_mic_active && !is_tool_running => {
+                    info!("[AudioProcessingTask] User speech ended signal. Sending audioStreamEnd.");
+                    *audio_task_app_state_clone.is_microphone_active.lock().await = false;
+                    info!("[AudioProcessingTask] Microphone paused due to VAD speech end.");
+
+                    let mut client_guard = audio_task_client_clone.lock().await;
+                    if let Err(e) = client_guard.send_audio_stream_end().await { // This now calls request_response for OpenAI
+                        error!("[AudioProcessingTask] Failed to send audioStreamEnd: {:?}", e);
+                    }
+                }
+                maybe_samples = audio_input_chunk_rx.recv(), if is_mic_active && !is_tool_running => {
+                    if let Some(samples_vec) = maybe_samples {
+                        if samples_vec.is_empty() { continue; }
+                        let mut client_guard = audio_task_client_clone.lock().await;
+                        if let Err(e) = client_guard.send_audio_chunk(&samples_vec, INPUT_SAMPLE_RATE_HZ).await {
+                            error!("[AudioProcessingTask] Failed to send audio: {:?}", e);
+                            if matches!(e, gemini_live_api::error::GeminiError::SendError | gemini_live_api::error::GeminiError::ConnectionClosed) {
+                                error!("[AudioProcessingTask] Connection error. Stopping task.");
+                                break;
+                            }
+                        }
+                    } else {
+                        info!("[AudioProcessingTask] Audio input channel closed. Stopping task.");
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)), if !is_mic_active || is_tool_running => {
+                    // Keep loop alive to re-evaluate conditions
+                }
+            }
+        }
+        info!("[AudioProcessingTask] Stopped.");
+    });
+
+    let _input_stream = setup_audio_input(audio_input_chunk_tx.clone(), app_state_for_main.clone())?;
+    let _output_stream = setup_audio_output(playback_rx)?;
+
+    *app_state_for_main.is_microphone_active.lock().await = true;
+    info!("Microphone active. Continuous OpenAI audio chat with tools. Press Ctrl+C to exit.");
+
+    loop {
+        tokio::select! {
+            _ = app_state_for_main.model_turn_complete_signal.notified() => {
+                info!("[MainLoop] OpenAI model turn complete signal.");
+                let tool_was_running = *app_state_for_main.is_tool_running.lock().await; // Check before clearing text
+                app_state_for_main.model_response_text.lock().await.clear();
+
+                if !tool_was_running { // Only reactivate mic if a tool wasn't the cause of this completion
+                    info!("[MainLoop] Model speech turn finished. Re-activating microphone.");
+                    *app_state_for_main.is_microphone_active.lock().await = true;
+                } else {
+                     // If a tool was running, it should set is_tool_running to false itself.
+                     // Then, if the model *also* speaks after the tool, this signal might fire again.
+                     // The logic in the tool (setting is_tool_running = false) AND this check here
+                     // combined with potentially re-activating mic if model speaks *after* tool, can get complex.
+                     // For now, we assume tools reset their flag, and if model speaks after, this handler will re-enable mic.
+                     // A more robust state machine might be needed for complex interactions.
+                    if !*app_state_for_main.is_tool_running.lock().await { // Check again, tool might have just finished
+                        info!("[MainLoop] Model turn completed (possibly after a tool). Re-activating microphone.");
+                        *app_state_for_main.is_microphone_active.lock().await = true;
+                    } else {
+                        info!("[MainLoop] Model turn completed, but a tool is still marked as running. Microphone remains paused by tool logic.");
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl+C received. Shutting down...");
+                *app_state_for_main.is_microphone_active.lock().await = false; // Immediately stop mic
+                app_state_for_main.user_speech_ended_signal.notify_one(); 
+                tokio::time::sleep(Duration::from_millis(300)).await; 
+                break;
+            }
+        }
+    }
+
+    *app_state_for_main.is_microphone_active.lock().await = false;
+    info!("Microphone deactivated by main loop exit.");
+    drop(audio_input_chunk_tx); 
+
+    {
+        let mut client_guard = client_arc.lock().await;
+        if !client_guard.is_closed() { 
+            info!("Sending final audioStreamEnd to OpenAI (if not already sent)...");
+            if let Err(e) = client_guard.send_audio_stream_end().await {
+                warn!("Failed to send final audioStreamEnd on shutdown: {:?}", e);
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    info!("Closing OpenAI Client...");
+    client_arc.lock().await.close().await?;
+    info!("OpenAI Client closed. Exiting.");
+    Ok(())
+}
+--- examples/function_calling.rs ---
+// examples/function_calling.rs
+use gemini_live_api::{
+    GeminiLiveClientBuilder,
+    // Renamed GeminiLiveClient to AiLiveClient in client::handle
+    client::{AiLiveClient, ServerContentContext, UsageMetadataContext},
+    tool_function,
+    types::*,
+};
+use std::{
+    env,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
+use tokio::sync::Notify;
+use tracing::{error, info};
+
+#[derive(Clone, Default, Debug)]
+struct AppStateWithMutex {
+    full_response: Arc<StdMutex<String>>,
+    call_count: Arc<StdMutex<u32>>,
+    interaction_complete_signal: Arc<Notify>,
+}
+
+// No AppState trait impl needed anymore
+
+#[tool_function("Calculates the sum of two numbers")]
+async fn sum(state: Arc<AppStateWithMutex>, a: f64, b: f64) -> f64 {
+    let mut count = state.call_count.lock().unwrap();
+    *count += 1;
+    info!(
+        "[Tool] sum called (count {}). Args: a={}, b={}",
+        *count, a, b
+    );
+    a + b
+}
+
+#[tool_function("Calculates the division of two numbers")]
+async fn divide(
+    _state_ignored: Arc<AppStateWithMutex>,
+    numerator: f64,
+    denominator: f64,
+) -> Result<f64, String> {
+    info!(
+        "[Tool] divide called with num={}, den={}",
+        numerator, denominator
+    );
+    if denominator == 0.0 {
+        Err("Cannot divide by zero.".to_string())
+    } else {
+        Ok(numerator / denominator)
+    }
+}
+
+async fn handle_usage_metadata(_ctx: UsageMetadataContext, app_state: Arc<AppStateWithMutex>) {
+    info!(
+        "[Handler] OpenAI Usage Metadata: {:?}, call count: {}",
+        _ctx.metadata,
+        app_state.call_count.lock().unwrap()
+    );
+}
+
+async fn handle_on_content(ctx: ServerContentContext, app_state: Arc<AppStateWithMutex>) {
+    if let Some(text) = ctx.text {
+        let mut full_res = app_state.full_response.lock().unwrap();
+        *full_res += &text;
+        *full_res += " ";
+        info!("[Handler] OpenAI Text: {}", text.trim());
+    }
+    if ctx.is_done {
+        // This signals the end of a content part (e.g., final text from a turn)
+        info!("[Handler] OpenAI content segment complete.");
+        // For function calling, the final response often comes after tool calls.
+        // The ModelTurnComplete or ModelGenerationComplete event is more reliable for signaling overall completion.
+        // We'll use a dedicated handler for ModelTurnComplete to notify.
+    }
+}
+
+async fn handle_model_turn_complete(app_state: Arc<AppStateWithMutex>) {
+    info!("[Handler] OpenAI ModelTurnComplete received. Signaling main loop.");
+    app_state.interaction_complete_signal.notify_one();
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    dotenv::dotenv().ok();
+
+    let api_key = env::var("API_KEY").map_err(|_| "OPENAI_API_KEY not set (using API_KEY)")?;
+    let model_name = env::var("OPENAI_MODEL_TOOLS").unwrap_or_else(|_| "gpt-4o".to_string()); // e.g. gpt-4-turbo or gpt-4o
+    info!("Using OpenAI Model for Tools: {}", model_name);
+
+    let app_state_value = AppStateWithMutex::default();
+
+    info!("Configuring Client for OpenAI Function Calling...");
+    let mut builder = GeminiLiveClientBuilder::<AppStateWithMutex>::new_with_model_and_state(
+        api_key,
+        model_name,
+        app_state_value.clone(),
+    );
+
+    builder = builder.generation_config(GenerationConfig {
+        response_modalities: Some(vec![ResponseModality::Text]),
+        temperature: Some(0.7),
+        ..Default::default()
+    });
+    builder = builder.system_instruction(Content {
+        parts: vec![Part {
+            text: Some("You are an OpenAI assistant that uses tools for calculations.".to_string()),
+            ..Default::default()
+        }],
+        role: Some(Role::System),
+        ..Default::default()
+    });
+
+    builder = builder.on_server_content(handle_on_content);
+    builder = builder.on_usage_metadata(handle_usage_metadata);
+    // Add on_model_turn_complete handler
+    // This requires adding the method to the builder:
+    // builder = builder.on_model_turn_complete(handle_model_turn_complete);
+
+    builder = sum_register_tool(builder);
+    builder = divide_register_tool(builder);
+
+    info!("Connecting OpenAI client...");
+    let mut client = builder.connect_openai().await?; // Use connect_openai
+
+    let user_prompt =
+        "Please calculate 15.5 + 7.2 for me. Then, divide that sum by 2. Then add 10 + 5.";
+    info!("Sending initial prompt: {}", user_prompt);
+    client.send_text_turn(user_prompt.to_string()).await?;
+    // `send_text_turn` for OpenAI now internally calls `request_response`
+
+    info!("Waiting for OpenAI interaction completion or Ctrl+C...");
+    let interaction_complete_notification = app_state_value.interaction_complete_signal.clone();
+    let timeout_duration = Duration::from_secs(180);
+
+    tokio::select! {
+        _ = interaction_complete_notification.notified() => {
+            info!("OpenAI interaction completion signaled.");
+            let final_text = app_state_value.full_response.lock().unwrap().trim().to_string();
+            let final_calls = *app_state_value.call_count.lock().unwrap();
+            info!(
+                "\n--- OpenAI Final Text Response ---\n{}\n--------------------\nTool call count: {}",
+                final_text, final_calls
+            );
+        }
+        _ = tokio::signal::ctrl_c() => { info!("Ctrl+C received."); }
+        _ = tokio::time::sleep(timeout_duration) => { error!("Interaction timed out after {} seconds.", timeout_duration.as_secs()); }
+    }
+
+    info!("Shutting down OpenAI client...");
+    client.close().await?;
+    info!("OpenAI Client closed.");
+    Ok(())
+}
+--- examples/minimal_test.rs ---
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{BufferSize, Sample, SampleFormat, SampleRate, StreamConfig}; // Added BufferSize
+
+fn minimal_cpal_output_test() -> Result<(), anyhow::Error> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .expect("No output device available");
+    println!("[MinimalTest] Using output device: {}", device.name()?);
+
+    let mut config = StreamConfig {
+        channels: 1,                          // Target
+        sample_rate: SampleRate(24000),       // Target
+        buffer_size: BufferSize::Fixed(2400), // Target (100ms at 24kHz)
+    };
+
+    // You could also try to get a supported config first that matches SampleFormat::I16
+    // and then try to set the sample_rate and buffer_size.
+    // For this direct test, we assume the device *should* support this.
+
+    println!(
+        "[MinimalTest] Attempting to build stream with config: {:?}",
+        config
+    );
+
+    let mut sample_clock = 0f32;
+    let sample_rate_f32 = config.sample_rate.0 as f32;
+
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+            for frame in data.chunks_mut(config.channels as usize) {
+                let value = ((sample_clock * 440.0 * 2.0 * std::f32::consts::PI / sample_rate_f32)
+                    .sin()
+                    * 0.5
+                    * i16::MAX as f32) as i16;
+                for sample in frame.iter_mut() {
+                    *sample = value;
+                }
+                sample_clock = (sample_clock + 1.0) % sample_rate_f32;
+            }
+        },
+        |err| eprintln!("[MinimalTest] CPAL stream error: {:?}", err),
+        None,
+    )?;
+    stream.play()?;
+    println!("[MinimalTest] Playing sine wave for 5 seconds...");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    println!("[MinimalTest] Done.");
+    Ok(())
+}
+
+// To run this, you could put it in a new file like `examples/minimal_test.rs`
+// and add `[[example]] name = "minimal_test" path = "examples/minimal_test.rs"` to Cargo.toml
+// Then run `cargo run --example minimal_test`
+
+fn main() {
+    minimal_cpal_output_test().unwrap();
+}
+--- gemini-live-macros/src/lib.rs ---
+extern crate proc_macro;
+
+use proc_macro::TokenStream;
+use quote::{ToTokens, format_ident, quote};
+use serde_json::json;
+use syn::{
+    AngleBracketedGenericArguments, Attribute, Error, FnArg, GenericArgument, ItemFn, Lit, LitStr,
+    Meta, MetaNameValue, Pat, PatType, Path, PathArguments, PathSegment, ReturnType, Type,
+    TypePath, parse_macro_input,
+};
+
+// Helper to extract the inner type from Arc<T>
+fn get_arc_inner_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(TypePath { path, .. }) = ty {
+        if let Some(last_seg) = path.segments.last() {
+            if last_seg.ident == "Arc" {
+                if let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                    args, ..
+                }) = &last_seg.arguments
+                {
+                    if let Some(GenericArgument::Type(inner_ty)) = args.first() {
+                        let is_std_arc = path.segments.len() == 1
+                            || (path.segments.len() >= 3
+                                && path.segments[path.segments.len() - 3].ident == "std"
+                                && path.segments[path.segments.len() - 2].ident == "sync")
+                            || (path.leading_colon.is_some()
+                                && path.segments.len() >= 3
+                                && path.segments[0].ident == "std"
+                                && path.segments[1].ident == "sync");
+                        if is_std_arc {
+                            return Some(inner_ty);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_description_from_doc_attrs(attrs: &[Attribute]) -> Option<String> {
+    let mut doc_lines = Vec::new();
+    for attr in attrs {
+        if attr.path().is_ident("doc") {
+            if let Meta::NameValue(MetaNameValue {
+                value: syn::Expr::Lit(expr_lit),
+                ..
+            }) = &attr.meta
+            {
+                if let Lit::Str(lit_str) = &expr_lit.lit {
+                    doc_lines.push(lit_str.value().trim().to_string());
+                }
+            }
+        }
+    }
+    if doc_lines.is_empty() {
+        None
+    } else {
+        Some(doc_lines.join("\n"))
+    }
+}
+
+fn rust_type_to_schema_info(ty: &Type) -> Result<(String, bool /* is_optional */), Error> {
+    if let Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            let type_name = segment.ident.to_string();
+            if type_name == "Option" {
+                if let PathArguments::AngleBracketed(angle_args) = &segment.arguments {
+                    if let Some(GenericArgument::Type(inner_ty)) = angle_args.args.first() {
+                        return rust_type_to_schema_info(inner_ty).map(|(s, _)| (s, true));
+                    }
+                }
+                return Err(Error::new_spanned(
+                    ty,
+                    "Option type must have a generic argument (e.g., Option<String>).",
+                ));
+            }
+            let schema_type_str = match type_name.as_str() {
+                "String" => "STRING",
+                "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" => {
+                    "INTEGER"
+                }
+                "f32" | "f64" => "NUMBER",
+                "bool" => "BOOLEAN",
+                _ => {
+                    return Err(Error::new_spanned(
+                        ty,
+                        format!(
+                            "Unsupported parameter type for Gemini/OpenAI schema: {}. Supported types: String, iXX/uXX, fXX, bool, Option<T>.",
+                            ty.to_token_stream()
+                        ),
+                    ));
+                }
+            };
+            return Ok((schema_type_str.to_string(), false));
+        }
+    }
+    Err(Error::new_spanned(
+        ty,
+        "Parameter type must be a simple path type.",
+    ))
+}
+
+fn rust_type_to_openai_json_schema_type(ty: &Type) -> Result<(String, bool), Error> {
+    if let Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            let type_name = segment.ident.to_string();
+            if type_name == "Option" {
+                if let PathArguments::AngleBracketed(angle_args) = &segment.arguments {
+                    if let Some(GenericArgument::Type(inner_ty)) = angle_args.args.first() {
+                        return rust_type_to_openai_json_schema_type(inner_ty)
+                            .map(|(s, _)| (s, true));
+                    }
+                }
+                return Err(Error::new_spanned(
+                    ty,
+                    "Option type must have a generic argument (e.g., Option<String>).",
+                ));
+            }
+            let schema_type_str = match type_name.as_str() {
+                "String" => "string",
+                "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" => {
+                    "integer"
+                }
+                "f32" | "f64" => "number",
+                "bool" => "boolean",
+                _ => {
+                    return Err(Error::new_spanned(
+                        ty,
+                        format!(
+                            "Unsupported parameter type for OpenAI schema: {}. Supported types: String, iXX/uXX, fXX, bool, Option<T>.",
+                            ty.to_token_stream()
+                        ),
+                    ));
+                }
+            };
+            return Ok((schema_type_str.to_string(), false));
+        }
+    }
+    Err(Error::new_spanned(
+        ty,
+        "Parameter type must be a simple path type for OpenAI schema.",
+    ))
+}
+
+fn get_result_types(ty: &Type) -> Option<(&Type, &Type)> {
+    if let Type::Path(TypePath {
+        path: Path { segments, .. },
+        ..
+    }) = ty
+    {
+        if let Some(PathSegment {
+            ident,
+            arguments: PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }),
+        }) = segments.last()
+        {
+            if (ident == "Result")
+                || (segments.len() > 1
+                    && segments[segments.len() - 2].ident == "result"
+                    && segments.last().unwrap().ident == "Result")
+            {
+                if args.len() == 2 {
+                    if let (
+                        Some(GenericArgument::Type(ok_ty)),
+                        Some(GenericArgument::Type(err_ty)),
+                    ) = (args.first(), args.last())
+                    {
+                        return Some((ok_ty, err_ty));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[proc_macro_attribute]
+pub fn tool_function(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    let func_sig = &func.sig;
+    let func_name = &func_sig.ident;
+    let func_async = func_sig.asyncness.is_some();
+    let func_name_str = func_name.to_string();
+
+    let description_from_attr = if !attr.is_empty() {
+        match parse_macro_input!(attr as LitStr) {
+            lit_str => Some(lit_str.value()),
+        }
+    } else {
+        None
+    };
+
+    let description_from_docs = get_description_from_doc_attrs(&func.attrs);
+
+    let final_description = match (description_from_attr, description_from_docs) {
+        (Some(attr_desc), _) => attr_desc,
+        (None, Some(doc_desc)) => doc_desc,
+        (None, None) => {
+            return TokenStream::from(
+                Error::new(
+                    func_name.span(),
+                    "Missing tool description: Add a /// doc comment or provide it in the attribute, e.g., #[tool_function(\"My description\")]",
+                )
+                .to_compile_error(),
+            );
+        }
+    };
+
+    if !func_async {
+        return TokenStream::from(
+            Error::new_spanned(func_sig.fn_token, "Tool function must be async").to_compile_error(),
+        );
+    }
+
+    let mut gemini_schema_properties = quote! {};
+    let mut gemini_required_params = Vec::<proc_macro2::TokenStream>::new();
+    let mut openai_schema_properties_map = serde_json::Map::new();
+    let mut openai_required_params = Vec::new();
+    let mut adapter_arg_parsing_code = quote! {};
+    let mut original_fn_invocation_args = Vec::<proc_macro2::TokenStream>::new();
+
+    let mut input_iter = func_sig.inputs.iter();
+    let mut concrete_state_type: Option<Type> = None;
+    let closure_state_param_ident = format_ident!("__tool_fn_state_arg_");
+
+    if let Some(FnArg::Typed(PatType { ty, .. })) = func_sig.inputs.first() {
+        if let Some(inner_ty) = get_arc_inner_type(ty) {
+            concrete_state_type = Some(inner_ty.clone());
+            input_iter.next();
+            original_fn_invocation_args.push(quote! { #closure_state_param_ident.clone() });
+        }
+    }
+
+    let mut number_of_json_params = 0;
+    for input in input_iter {
+        number_of_json_params += 1;
+        let param_pat_type = match input {
+            FnArg::Typed(pt) => pt,
+            FnArg::Receiver(_) => {
+                return TokenStream::from(
+                    Error::new_spanned(input, "Tool function parameters cannot be `self`")
+                        .to_compile_error(),
+                );
+            }
+        };
+
+        let param_name_ident = match &*param_pat_type.pat {
+            Pat::Ident(pat_ident) => &pat_ident.ident,
+            _ => {
+                return TokenStream::from(
+                    Error::new_spanned(
+                        param_pat_type.clone().pat.clone(),
+                        "Tool function parameters must be simple identifiers (e.g., `my_arg: String`)",
+                    )
+                    .to_compile_error(),
+                );
+            }
+        };
+        let param_ty_box = param_pat_type.clone().ty.clone();
+        let param_ty_ref = &*param_ty_box;
+        let param_name_str = param_name_ident.to_string();
+        original_fn_invocation_args.push(quote! { #param_name_ident });
+
+        let (gemini_schema_type_str, gemini_param_is_optional) =
+            match rust_type_to_schema_info(param_ty_ref) {
+                Ok(info) => info,
+                Err(e) => return TokenStream::from(e.to_compile_error()),
+            };
+        gemini_schema_properties.extend(quote! {
+            (#param_name_str.to_string(), ::gemini_live_api::types::Schema {
+                schema_type: #gemini_schema_type_str.to_string(),
+                ..Default::default()
+            }),
+        });
+        if !gemini_param_is_optional {
+            gemini_required_params.push(quote! { #param_name_str.to_string() });
+        }
+
+        let (openai_json_type_str, openai_param_is_optional) =
+            match rust_type_to_openai_json_schema_type(param_ty_ref) {
+                Ok(info) => info,
+                Err(e) => return TokenStream::from(e.to_compile_error()),
+            };
+        openai_schema_properties_map.insert(
+            param_name_str.clone(),
+            json!({ "type": openai_json_type_str }),
+        );
+        if !openai_param_is_optional {
+            openai_required_params.push(param_name_str.clone());
+        }
+
+        let temp_val_ident = format_ident!("__tool_arg_{}_json_val", param_name_str);
+        let parsing_code = if gemini_param_is_optional {
+            quote! {
+                let #temp_val_ident = __args_obj.get(#param_name_str).cloned();
+                let #param_name_ident : #param_ty_box = match #temp_val_ident {
+                    Some(::serde_json::Value::Null) | None => None,
+                    Some(val) => {
+                        let val_clone_for_err = val.clone();
+                        Some(::serde_json::from_value(val).map_err(|e| format!("Failed to parse optional argument '{}': {} from value {:?}", #param_name_str, e, val_clone_for_err))?)
+                    }
+                };
+            }
+        } else {
+            quote! {
+                let #temp_val_ident = __args_obj.get(#param_name_str).cloned();
+                let #param_name_ident : #param_ty_box = match #temp_val_ident {
+                    Some(val) => {
+                        let val_clone_for_err = val.clone();
+                        ::serde_json::from_value(val).map_err(|e| format!("Failed to parse required argument '{}': {} from value {:?}", #param_name_str, e, val_clone_for_err))?
+                    }
+                    None => return Err(format!("Missing required argument '{}'", #param_name_str)),
+                };
+            }
+        };
+        adapter_arg_parsing_code.extend(parsing_code);
+    }
+
+    let gemini_schema_map = if gemini_schema_properties.is_empty() {
+        quote! { None }
+    } else {
+        quote! { Some(::std::collections::HashMap::from([#gemini_schema_properties])) }
+    };
+    let gemini_required_vec = if gemini_required_params.is_empty() {
+        quote! { None }
+    } else {
+        quote! { Some(vec![#(#gemini_required_params),*]) }
+    };
+
+    let gemini_parameters_schema = if number_of_json_params > 0 {
+        quote! {
+            Some(::gemini_live_api::types::Schema {
+                schema_type: "OBJECT".to_string(),
+                properties: #gemini_schema_map,
+                required: #gemini_required_vec,
+                ..Default::default()
+            })
+        }
+    } else {
+        quote! { None }
+    };
+
+    let gemini_declaration_code = quote! {
+         fn get_gemini_declaration() -> ::gemini_live_api::types::FunctionDeclaration {
+             ::gemini_live_api::types::FunctionDeclaration {
+                 name: #func_name_str.to_string(),
+                 description: #final_description.to_string(),
+                 parameters: #gemini_parameters_schema,
+             }
+         }
+    };
+
+    let openai_parameters_def_obj = if number_of_json_params > 0 {
+        json!({
+            "type": "object",
+            "properties": openai_schema_properties_map,
+            "required": openai_required_params
+        })
+    } else {
+        json!({ "type": "object", "properties": {} })
+    };
+
+    // <<< MODIFIED HERE for OpenAI Realtime API tool structure >>>
+    let openai_tool_def_json = json!({
+        "type": "function",
+        "name": func_name_str.clone(),
+        "description": final_description.clone(),
+        "parameters": openai_parameters_def_obj,
+    });
+    // The above line was:
+    // "function": { "name": ..., "description": ..., "parameters": ... }
+    // Now name, description, parameters are direct children of the tool object if type is "function".
+
+    let openai_def_str = openai_tool_def_json.to_string();
+    let openai_definition_code = quote! {
+         fn get_openai_definition() -> ::serde_json::Value {
+             ::serde_json::from_str(#openai_def_str)
+                .expect("Internal Error: Failed to parse static OpenAI JSON definition")
+         }
+    };
+
+    let adapter_return_handling_code = match &func_sig.output {
+        ReturnType::Default => {
+            quote! { __result_invocation_block.await; Ok(::serde_json::Value::Null) }
+        }
+        ReturnType::Type(_, ty_box) => {
+            let ty_ref = &**ty_box;
+            if let Some((ok_ty, _err_ty)) = get_result_types(ty_ref) {
+                quote! {
+                    let __result_val = __result_invocation_block.await;
+                    match __result_val {
+                        Ok(ok_val) => ::serde_json::to_value(ok_val).map_err(|e| format!("Failed to serialize success result type {}: {}", stringify!(#ok_ty), e)),
+                        Err(err_val) => Err(format!("{}", err_val)),
+                    }
+                }
+            } else {
+                quote! {
+                    let __result_val = __result_invocation_block.await;
+                    ::serde_json::to_value(__result_val).map_err(|e| format!("Failed to serialize function result type {}: {}", stringify!(#ty_ref), e))
+                }
+            }
+        }
+    };
+
+    let register_tool_fn_name = format_ident!("{}_register_tool", func_name);
+
+    let args_obj_match_block = quote! {
+        let __args_obj: ::serde_json::Map<String, ::serde_json::Value> = match __args_json {
+            Some(::serde_json::Value::Object(map)) => map,
+            None if #number_of_json_params == 0 => ::serde_json::Map::new(),
+            None => return Err(format!("Tool '{}' requires arguments (a JSON object), but got null/none.", #func_name_str)),
+            Some(other_json_value) => {
+                if #number_of_json_params == 0 {
+                    ::serde_json::Map::new()
+                } else {
+                    return Err(format!("Tool '{}' arguments must be a JSON object, got: {:?}", #func_name_str, other_json_value));
+                }
+            }
+        };
+    };
+
+    let (builder_generic_param_for_fn, builder_state_generic_decl) =
+        if let Some(state_ty) = &concrete_state_type {
+            (quote! { #state_ty }, quote! {})
+        } else {
+            (
+                quote! { S_BUILDER_STATE },
+                quote! { <S_BUILDER_STATE: Clone + Send + Sync + 'static> },
+            )
+        };
+
+    let closure_state_param_type_for_fn = if let Some(state_ty) = &concrete_state_type {
+        quote! { ::std::sync::Arc<#state_ty> }
+    } else {
+        quote! { ::std::sync::Arc<S_BUILDER_STATE> }
+    };
+
+    let registration_code = quote! {
+        pub fn #register_tool_fn_name #builder_state_generic_decl (
+            builder: ::gemini_live_api::client::builder::AiClientBuilder<#builder_generic_param_for_fn>
+        ) -> ::gemini_live_api::client::builder::AiClientBuilder<#builder_generic_param_for_fn>
+        {
+            let tool_adapter_closure = ::std::sync::Arc::new(
+                move |__args_json: Option<::serde_json::Value>, #closure_state_param_ident: #closure_state_param_type_for_fn|
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<::serde_json::Value, String>> + Send>>
+                {
+                    Box::pin(async move {
+                        #args_obj_match_block
+                        #adapter_arg_parsing_code
+                        let __result_invocation_block = async { #func_name(#(#original_fn_invocation_args),*).await };
+                        #adapter_return_handling_code
+                    })
+                }
+            );
+
+            builder.add_tool_internal(
+                #func_name_str.to_string(),
+                get_gemini_declaration(),
+                get_openai_definition(),
+                tool_adapter_closure,
+            )
+        }
+    };
+
+    let output = quote! {
+        #func
+
+        #[allow(non_snake_case)]
+        mod #func_name {
+            use super::*;
+            #gemini_declaration_code
+            #openai_definition_code
+            #registration_code
+        }
+        pub use #func_name::#register_tool_fn_name;
+    };
+    output.into()
+}
+--- src/client/backend.rs ---
+use crate::client::handlers::Handlers;
+use crate::error::GeminiError;
+use crate::types::*;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex as TokioMutex;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::protocol::Message};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiProvider {
+    Gemini,
+    OpenAi,
+}
+
+#[derive(Debug, Clone)]
+pub enum UnifiedServerEvent {
+    /* ... (unchanged) ... */
+    SetupComplete,
+    ContentUpdate {
+        text: Option<String>,
+        audio: Option<Vec<i16>>,
+        done: bool,
+    },
+    TranscriptionUpdate {
+        text: String,
+        done: bool,
+    },
+    ToolCall {
+        id: Option<String>,
+        name: String,
+        args: Value,
+    },
+    ModelTurnComplete,
+    ModelGenerationComplete,
+    UsageMetadata(UsageMetadata),
+    Error(ApiError),
+    ProviderSpecific(Value),
+    Close,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    /* ... (unchanged) ... */
+    pub code: String,
+    pub message: String,
+    pub event_id: Option<String>,
+}
+
+pub type WsSink =
+    futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+
+// AppState trait and DowncastArc REMOVED
+
+#[derive(Clone, Debug, Default)]
+pub struct BackendConfig {
+    /* ... (unchanged) ... */
+    pub model: String,
+    pub system_instruction: Option<Content>,
+    pub generation_config: Option<GenerationConfig>,
+    pub tools: Vec<ToolDefinition>,
+    pub realtime_input_config: Option<RealtimeInputConfig>,
+    pub output_audio_transcription: Option<AudioTranscriptionConfig>,
+    pub voice: Option<String>,
+    pub input_audio_format: Option<String>,
+    pub output_audio_format: Option<String>,
+    pub transcription_model: Option<String>,
+    pub transcription_language: Option<String>,
+    pub transcription_prompt: Option<String>,
+    pub include_logprobs: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolDefinition {
+    /* ... (unchanged) ... */
+    pub name: String,
+    pub gemini_declaration: FunctionDeclaration,
+    pub openai_definition: Value,
+}
+
+// Trait is now generic over S
+#[async_trait]
+pub trait LiveApiBackend<S: Clone + Send + Sync + 'static>: Send + Sync + 'static {
+    fn provider_type(&self) -> ApiProvider;
+    fn get_websocket_url(&self, api_key: &str) -> Result<url::Url, GeminiError>;
+    fn configure_websocket_request(
+        &self,
+        api_key: &str,
+        request: http::Request<()>,
+        config: &BackendConfig,
+    ) -> Result<http::Request<()>, GeminiError>;
+    async fn get_initial_messages(
+        &self,
+        config: &BackendConfig,
+    ) -> Result<Vec<String>, GeminiError>;
+    fn build_session_update_message(&self, config: &BackendConfig) -> Result<String, GeminiError>;
+    fn build_text_turn_message(&self, text: String) -> Result<String, GeminiError>;
+    fn build_audio_chunk_message(
+        &self,
+        audio_samples: &[i16],
+        sample_rate: u32,
+        config: &BackendConfig,
+    ) -> Result<String, GeminiError>;
+    fn build_audio_stream_end_message(&self) -> Result<String, GeminiError>;
+    fn build_tool_response_message(
+        &self,
+        responses: Vec<FunctionResponse>,
+    ) -> Result<String, GeminiError>;
+    fn build_request_response_message(&self) -> Result<String, GeminiError>;
+
+    // parse_server_message now uses the S from the trait bound
+    async fn parse_server_message(
+        &self,
+        message: Message,
+        handlers: &Arc<Handlers<S>>, // S from trait
+        state: &Arc<S>,              // S from trait
+        ws_sink: &Arc<TokioMutex<WsSink>>,
+        output_audio_format: &Option<String>, // Pass by reference
+    ) -> Result<Vec<UnifiedServerEvent>, GeminiError>;
+}
+--- src/client/builder.rs ---
+// src/client/builder.rs
+use super::backend::{ApiProvider, BackendConfig, LiveApiBackend, ToolDefinition};
+use super::gemini_backend::GeminiBackend;
+use super::handle::AiLiveClient; // Use Renamed AiLiveClient
+use super::handlers::{
+    EventHandlerSimple, Handlers, ServerContentContext, ToolHandler, UsageMetadataContext,
+};
+use super::openai_backend::OpenAiBackend;
+use crate::error::GeminiError;
+use crate::types::*;
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
+use tracing::info;
+
+//=========== RENAMED HERE ===========
+pub struct AiClientBuilder<S: Clone + Send + Sync + 'static> {
+    //====================================
+    api_key: String,
+    backend_config: BackendConfig,
+    handlers: Handlers<S>,
+    state: S,
+    tool_declarations: Vec<ToolDefinition>,
+}
+
+//=========== RENAMED HERE ===========
+impl<S: Clone + Send + Sync + 'static + Default> AiClientBuilder<S> {
+    //====================================
+    pub fn new(api_key: String, model: String) -> Self {
+        Self::new_with_model_and_state(api_key, model, S::default())
+    }
+}
+
+//=========== RENAMED HERE ===========
+impl<S: Clone + Send + Sync + 'static> AiClientBuilder<S> {
+    //====================================
+    pub fn new_with_model_and_state(api_key: String, model: String, state: S) -> Self {
+        Self {
+            api_key,
+            backend_config: BackendConfig {
+                model,
+                ..Default::default()
+            },
+            handlers: Handlers::default(),
+            state,
+            tool_declarations: Vec::new(),
+        }
+    }
+
+    // ... (All .generation_config(), .voice(), .add_tool_internal(), etc. methods unchanged) ...
+    pub fn generation_config(mut self, config: GenerationConfig) -> Self {
+        self.backend_config.generation_config = Some(config);
+        self
+    }
+    pub fn system_instruction(mut self, instruction: Content) -> Self {
+        self.backend_config.system_instruction = Some(instruction);
+        self
+    }
+    pub fn realtime_input_config(mut self, config: RealtimeInputConfig) -> Self {
+        self.backend_config.realtime_input_config = Some(config);
+        self
+    }
+    pub fn output_audio_transcription(mut self, config: AudioTranscriptionConfig) -> Self {
+        self.backend_config.output_audio_transcription = Some(config);
+        self
+    }
+    pub fn voice(mut self, voice: String) -> Self {
+        self.backend_config.voice = Some(voice);
+        self
+    }
+    pub fn input_audio_format(mut self, format: String) -> Self {
+        self.backend_config.input_audio_format = Some(format);
+        self
+    }
+    pub fn output_audio_format(mut self, format: String) -> Self {
+        self.backend_config.output_audio_format = Some(format);
+        self
+    }
+    pub fn transcription_model(mut self, model: String) -> Self {
+        self.backend_config.transcription_model = Some(model);
+        self
+    }
+    pub fn transcription_language(mut self, lang: String) -> Self {
+        self.backend_config.transcription_language = Some(lang);
+        self
+    }
+    pub fn transcription_prompt(mut self, prompt: String) -> Self {
+        self.backend_config.transcription_prompt = Some(prompt);
+        self
+    }
+    pub fn include_logprobs(mut self, include: bool) -> Self {
+        self.backend_config.include_logprobs = include;
+        self
+    }
+    #[doc(hidden)]
+    pub fn add_tool_internal(
+        mut self,
+        name: String,
+        gemini_decl: FunctionDeclaration,
+        openai_def: Value,
+        handler: Arc<dyn ToolHandler<S>>,
+    ) -> Self {
+        self.tool_declarations.push(ToolDefinition {
+            name: name.clone(),
+            gemini_declaration: gemini_decl,
+            openai_definition: openai_def,
+        });
+        self.handlers.tool_handlers.insert(name, handler);
+        self
+    }
+    pub fn on_server_content(
+        mut self,
+        handler: impl EventHandlerSimple<ServerContentContext, S> + 'static,
+    ) -> Self {
+        self.handlers.on_server_content = Some(Arc::new(handler));
+        self
+    }
+    pub fn on_usage_metadata(
+        mut self,
+        handler: impl EventHandlerSimple<UsageMetadataContext, S> + 'static,
+    ) -> Self {
+        self.handlers.on_usage_metadata = Some(Arc::new(handler));
+        self
+    }
+    //-------------------------------------------------------------------------
+
+    // Generic PRIVATE connect method used by public ones
+    async fn connect_internal<B: LiveApiBackend<S> + 'static>(
+        mut self,
+        backend_instance: B,
+    ) -> Result<AiLiveClient<S, B>, GeminiError> {
+        self.backend_config.tools = self.tool_declarations; // Move tools into final config
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (outgoing_sender, outgoing_receiver) = mpsc::channel::<String>(100);
+
+        let state_arc = Arc::new(self.state);
+        let handlers_arc = Arc::new(self.handlers);
+        let concrete_backend_arc = Arc::new(backend_instance);
+
+        info!(
+            "Spawning processing task for provider: {:?}",
+            concrete_backend_arc.provider_type()
+        );
+
+        super::connection::spawn_processing_task(
+            self.api_key.clone(),
+            concrete_backend_arc.clone(),
+            self.backend_config.clone(),
+            handlers_arc,
+            state_arc.clone(),
+            shutdown_rx,
+            outgoing_receiver,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        info!("Client connection process initiated.");
+        Ok(AiLiveClient {
+            shutdown_tx: Some(shutdown_tx),
+            outgoing_sender: Some(outgoing_sender),
+            state: state_arc,
+            backend: concrete_backend_arc,
+            backend_config: self.backend_config,
+        })
+    }
+
+    /// Connect using the Gemini Backend.
+    pub async fn connect_gemini(self) -> Result<AiLiveClient<S, GeminiBackend>, GeminiError> {
+        self.connect_internal(GeminiBackend).await
+    }
+
+    /// Connect using the OpenAI Backend.
+    pub async fn connect_openai(self) -> Result<AiLiveClient<S, OpenAiBackend>, GeminiError> {
+        self.connect_internal(OpenAiBackend).await
+    }
+}
+--- src/client/connection.rs ---
+use super::backend::{BackendConfig, LiveApiBackend, UnifiedServerEvent}; // AppState removed
+use super::handlers::{Handlers, ServerContentContext, UsageMetadataContext};
+use crate::error::GeminiError;
+use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
+use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::{Instrument, Span, debug, error, info, info_span, trace};
+
+// Now generic over S (state) and B (backend type)
+pub(crate) fn spawn_processing_task<
+    S: Clone + Send + Sync + 'static,
+    B: LiveApiBackend<S> + 'static, // B implements LiveApiBackend<S>
+>(
+    api_key: String,
+    backend: Arc<B>, // Arc<ConcreteBackend>
+    backend_config: BackendConfig,
+    handlers: Arc<Handlers<S>>,
+    state: Arc<S>,
+    shutdown_rx: oneshot::Receiver<()>,
+    outgoing_receiver: mpsc::Receiver<String>,
+) {
+    let task_span = info_span!("connection_task", provider = ?backend.provider_type(), model = %backend_config.model);
+    tokio::spawn(
+        async move {
+            info!("Processing task starting...");
+            match connect_and_listen(
+                api_key,
+                backend,
+                backend_config,
+                handlers,
+                state,
+                shutdown_rx,
+                outgoing_receiver,
+            )
+            .await
+            {
+                Ok(_) => info!("Processing task finished gracefully."),
+                Err(e) => error!("Processing task failed: {:?}", e),
+            }
+        }
+        .instrument(task_span),
+    );
+}
+
+async fn connect_and_listen<
+    S: Clone + Send + Sync + 'static,
+    B: LiveApiBackend<S> + 'static, // B implements LiveApiBackend<S>
+>(
+    api_key: String,
+    backend: Arc<B>, // Arc<ConcreteBackend>
+    backend_config: BackendConfig,
+    handlers: Arc<Handlers<S>>,
+    state: Arc<S>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    mut outgoing_rx: mpsc::Receiver<String>,
+) -> Result<(), GeminiError> {
+    // ... (URL and request setup unchanged, uses `backend` directly) ...
+    let url = backend.get_websocket_url(&api_key)?;
+    info!("Attempting to connect to WebSocket: {}", url);
+
+    let base_request = http::Request::builder()
+        .method("GET")
+        .uri(url.as_str())
+        .body(())
+        .map_err(|e| {
+            GeminiError::ConfigurationError(format!("Failed to build base request: {}", e))
+        })?;
+    let configured_request =
+        backend.configure_websocket_request(&api_key, base_request, &backend_config)?;
+    trace!("Configured WebSocket request: {:?}", configured_request);
+
+    let (ws_stream, response) = match connect_async(configured_request).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("WebSocket connection failed: {}", e);
+            return Err(GeminiError::WebSocketError(e));
+        }
+    };
+    info!(
+        "WebSocket handshake successful. Status: {}",
+        response.status()
+    );
+    if !response.status().is_success() && response.status().as_u16() != 101 {
+        error!(
+            "WebSocket handshake returned non-success status: {}",
+            response.status()
+        );
+        return Err(GeminiError::ApiError(format!(
+            "WebSocket handshake failed with status {}",
+            response.status()
+        )));
+    }
+
+    let (ws_sink_split, mut ws_stream_split) = ws_stream.split();
+    // Provide explicit type for TokioMutex if needed, though often inferred.
+    // WsSink is defined in backend.rs
+    let ws_sink_arc: Arc<TokioMutex<super::backend::WsSink>> =
+        Arc::new(TokioMutex::new(ws_sink_split));
+
+    let initial_messages = backend.get_initial_messages(&backend_config).await?;
+    if !initial_messages.is_empty() {
+        debug!("Sending {} initial message(s)...", initial_messages.len());
+        let mut sink_guard = ws_sink_arc.lock().await;
+        for msg in initial_messages {
+            trace!("Sending initial message content: {}", msg);
+            if let Err(e) = sink_guard.send(Message::Text(msg.into())).await {
+                error!("Failed to send initial message: {}", e);
+                return Err(GeminiError::WebSocketError(e));
+            }
+        }
+        drop(sink_guard);
+        debug!("Initial message(s) sent.");
+    } else {
+        debug!("No initial messages to send.");
+    }
+    let output_audio_format = backend_config.output_audio_format.clone();
+
+    info!("Entering main processing loop...");
+    loop {
+        tokio::select! {
+            // ... (select logic unchanged, parse_server_message calls are now on Arc<B>) ...
+            biased;
+            _ = &mut shutdown_rx => {
+                info!("Shutdown signal received. Closing WebSocket connection.");
+                let mut sink_guard = ws_sink_arc.lock().await;
+                let _ = sink_guard.send(Message::Close(None)).await;
+                let _ = sink_guard.close().await;
+                drop(sink_guard);
+                info!("WebSocket closed due to shutdown signal.");
+                return Ok(());
+            }
+            maybe_outgoing = outgoing_rx.recv() => {
+                if let Some(json_message) = maybe_outgoing {
+                    trace!("Sending outgoing message ({})", json_message);
+                    let mut sink_guard = ws_sink_arc.lock().await;
+                    if let Err(e) = sink_guard.send(Message::Text(json_message.into())).await {
+                        error!("Failed to send outgoing message via WebSocket: {}", e);
+                        if matches!(e, tokio_tungstenite::tungstenite::Error::ConnectionClosed | tokio_tungstenite::tungstenite::Error::AlreadyClosed) {
+                            error!("Connection closed, cannot send message. Exiting task.");
+                            drop(sink_guard);
+                            return Err(GeminiError::ConnectionClosed);
+                        }
+                    }
+                    drop(sink_guard);
+                } else {
+                    info!("Outgoing message channel closed. Listener will stop accepting new messages.");
+                }
+            }
+            msg_result = ws_stream_split.next() => {
+                match msg_result {
+                    Some(Ok(message)) => {
+                        trace!("Received WebSocket message type: {:?}", message);
+                        let current_span = Span::current();
+                        match backend.parse_server_message(
+                            message, &handlers, &state, &ws_sink_arc, &output_audio_format
+                        ).instrument(current_span).await {
+                            Ok(unified_events) => {
+                                if unified_events.is_empty() { continue; }
+                                let mut should_stop = false;
+                                for event in unified_events {
+                                    trace!("Processing unified event: {:?}", event);
+                                    if handle_unified_event(event, &handlers, &state).await {
+                                        should_stop = true; break;
+                                    }
+                                }
+                                if should_stop {
+                                    info!("Stop signal received from event handler (Close event). Exiting loop.");
+                                    break;
+                                }
+                            }
+                            Err(e) => { error!("Error processing server message: {:?}", e); }
+                        }
+                    }
+                    Some(Err(e)) => { error!("WebSocket read error: {:?}", e); return Err(GeminiError::WebSocketError(e)); }
+                    None => { info!("WebSocket stream ended (server closed connection)."); return Ok(()); }
+                }
+            }
+        }
+    }
+
+    info!("Listen loop exited. Cleaning up.");
+    let mut sink_guard = ws_sink_arc.lock().await;
+    let _ = sink_guard.close().await;
+    drop(sink_guard);
+    Ok(())
+}
+
+// handle_unified_event is now generic over S
+async fn handle_unified_event<S: Clone + Send + Sync + 'static>(
+    event: UnifiedServerEvent,
+    handlers: &Arc<Handlers<S>>,
+    state: &Arc<S>,
+) -> bool {
+    // ... (logic inside handle_unified_event unchanged)
+    match event {
+        UnifiedServerEvent::SetupComplete => {
+            info!("Connection setup complete.");
+        }
+        UnifiedServerEvent::ContentUpdate { text, audio, done } => {
+            if let Some(handler) = &handlers.on_server_content {
+                let ctx = ServerContentContext {
+                    text,
+                    audio,
+                    is_done: done,
+                };
+                handler.call(ctx, state.clone()).await;
+            } else {
+                if let Some(t) = text {
+                    info!("[Content Text]: {}", t);
+                }
+                if let Some(a) = audio {
+                    info!("[Content Audio]: {} samples", a.len());
+                }
+                if done {
+                    trace!("[Content Part Done]");
+                }
+            }
+        }
+        UnifiedServerEvent::TranscriptionUpdate { text, done } => {
+            info!(
+                "[Transcription]: {}{}",
+                text,
+                if done { " (Final)" } else { "" }
+            );
+        }
+        UnifiedServerEvent::ToolCall { id, name, args } => {
+            info!(
+                "[Tool Call Requested] Name: '{}', ID: {:?}, Args: {:?}",
+                name, id, args
+            );
+        }
+        UnifiedServerEvent::ModelTurnComplete => {
+            info!("Model turn complete.");
+        }
+        UnifiedServerEvent::ModelGenerationComplete => {
+            info!("Model generation complete.");
+        }
+        UnifiedServerEvent::UsageMetadata(metadata) => {
+            if let Some(handler) = &handlers.on_usage_metadata {
+                let ctx = UsageMetadataContext { metadata };
+                handler.call(ctx, state.clone()).await;
+            } else {
+                info!("[Usage Metadata]: {:?}", metadata);
+            }
+        }
+        UnifiedServerEvent::Error(api_error) => {
+            error!(
+                "API Error Received: Code='{}', Msg='{}', ClientEventID={:?}",
+                api_error.code, api_error.message, api_error.event_id
+            );
+        }
+        UnifiedServerEvent::ProviderSpecific(value) => {
+            debug!("Received provider specific event: {:?}", value);
+        }
+        UnifiedServerEvent::Close => {
+            info!("Server initiated connection close.");
+            return true;
+        }
+    }
+    false
+}
+--- src/client/gemini_backend.rs ---
+use super::backend::*;
+use crate::client::handlers::Handlers;
+use crate::error::GeminiError;
+use crate::types::*;
+use async_trait::async_trait;
+use base64::Engine as _;
+use futures_util::SinkExt;
+use serde_json::{Value, json};
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tracing::{error, info, trace, warn};
+
+pub struct GeminiBackend;
+
+// decode_gemini_audio unchanged
+impl GeminiBackend {
+    fn decode_gemini_audio(blob: &Blob) -> Result<Vec<i16>, GeminiError> {
+        match base64::engine::general_purpose::STANDARD.decode(&blob.data) {
+            Ok(decoded_bytes) => {
+                if decoded_bytes.len() % 2 != 0 {
+                    warn!(
+                        "Decoded Gemini audio data has odd number of bytes, discarding last byte."
+                    );
+                }
+                let samples = decoded_bytes
+                    .chunks_exact(2)
+                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+                Ok(samples)
+            }
+            Err(e) => Err(GeminiError::DeserializationError(format!(
+                "Base64 decode failed: {}",
+                e
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl<S: Clone + Send + Sync + 'static> LiveApiBackend<S> for GeminiBackend {
+    // Generic S here
+    // ... (get_websocket_url, configure_websocket_request, get_initial_messages unchanged)
+    fn provider_type(&self) -> ApiProvider {
+        ApiProvider::Gemini
+    }
+
+    fn get_websocket_url(&self, api_key: &str) -> Result<url::Url, GeminiError> {
+        let url_str = format!(
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={}",
+            api_key
+        );
+        url::Url::parse(&url_str)
+            .map_err(|e| GeminiError::ConfigurationError(format!("Invalid Gemini URL: {}", e)))
+    }
+
+    fn configure_websocket_request(
+        &self,
+        _api_key: &str,
+        request: http::Request<()>,
+        _config: &BackendConfig,
+    ) -> Result<http::Request<()>, GeminiError> {
+        Ok(request)
+    }
+
+    async fn get_initial_messages(
+        &self,
+        config: &BackendConfig,
+    ) -> Result<Vec<String>, GeminiError> {
+        let setup = BidiGenerateContentSetup {
+            model: config.model.clone(),
+            generation_config: config.generation_config.clone(),
+            system_instruction: config.system_instruction.clone(),
+            tools: if config.tools.is_empty() {
+                None
+            } else {
+                Some(vec![Tool {
+                    function_declarations: config
+                        .tools
+                        .iter()
+                        .map(|t| t.gemini_declaration.clone())
+                        .collect(),
+                }])
+            },
+            realtime_input_config: config.realtime_input_config.clone(),
+            output_audio_transcription: config.output_audio_transcription.clone(),
+            session_resumption: None,
+            context_window_compression: None,
+        };
+        let payload = ClientMessagePayload::Setup(setup);
+        let json = serde_json::to_string(&payload)?;
+        Ok(vec![json])
+    }
+
+    fn build_session_update_message(&self, _config: &BackendConfig) -> Result<String, GeminiError> {
+        Err(GeminiError::UnsupportedOperation(
+            "Session update message not applicable for Gemini".to_string(),
+        ))
+    }
+
+    fn build_text_turn_message(&self, text: String) -> Result<String, GeminiError> {
+        let content_part = Part {
+            text: Some(text),
+            ..Default::default()
+        };
+        let content = Content {
+            parts: vec![content_part],
+            role: Some(Role::User),
+        };
+        let client_content_msg = BidiGenerateContentClientContent {
+            turns: Some(vec![content]),
+            turn_complete: Some(true),
+        };
+        let payload = ClientMessagePayload::ClientContent(client_content_msg);
+        serde_json::to_string(&payload).map_err(GeminiError::from)
+    }
+
+    fn build_audio_chunk_message(
+        &self,
+        audio_samples: &[i16],
+        sample_rate: u32,
+        _config: &BackendConfig,
+    ) -> Result<String, GeminiError> {
+        if audio_samples.is_empty() {
+            return Err(GeminiError::ConfigurationError(
+                "Audio samples cannot be empty".to_string(),
+            ));
+        }
+        let mut byte_data = Vec::with_capacity(audio_samples.len() * 2);
+        for sample in audio_samples {
+            byte_data.extend_from_slice(&sample.to_le_bytes());
+        }
+        let encoded_data = base64::engine::general_purpose::STANDARD.encode(&byte_data);
+        let mime_type = format!("audio/pcm;rate={}", sample_rate);
+        let audio_blob = Blob {
+            mime_type,
+            data: encoded_data,
+        };
+        let payload = ClientMessagePayload::RealtimeInput(BidiGenerateContentRealtimeInput {
+            audio: Some(audio_blob),
+            ..Default::default()
+        });
+        serde_json::to_string(&payload).map_err(GeminiError::from)
+    }
+
+    fn build_audio_stream_end_message(&self) -> Result<String, GeminiError> {
+        let payload = ClientMessagePayload::RealtimeInput(BidiGenerateContentRealtimeInput {
+            audio_stream_end: Some(true),
+            ..Default::default()
+        });
+        serde_json::to_string(&payload).map_err(GeminiError::from)
+    }
+
+    fn build_tool_response_message(
+        &self,
+        responses: Vec<FunctionResponse>,
+    ) -> Result<String, GeminiError> {
+        let payload = ClientMessagePayload::ToolResponse(BidiGenerateContentToolResponse {
+            function_responses: responses,
+        });
+        serde_json::to_string(&payload).map_err(GeminiError::from)
+    }
+
+    fn build_request_response_message(&self) -> Result<String, GeminiError> {
+        Err(GeminiError::UnsupportedOperation(
+            "Explicit response request not applicable for Gemini".to_string(),
+        ))
+    }
+
+    async fn parse_server_message(
+        &self,
+        message: Message,
+        handlers: &Arc<Handlers<S>>, // S from trait
+        state: &Arc<S>,              // S from trait
+        ws_sink: &Arc<TokioMutex<WsSink>>,
+        _output_audio_format: &Option<String>,
+    ) -> Result<Vec<UnifiedServerEvent>, GeminiError> {
+        let text = match message {
+            Message::Text(t_str) => t_str,
+            Message::Binary(b) => String::from_utf8(b.to_vec())
+                .map_err(|e| {
+                    GeminiError::DeserializationError(format!(
+                        "Invalid UTF-8 in binary message: {}",
+                        e
+                    ))
+                })?
+                .into(),
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(vec![]),
+            Message::Close(_) => return Ok(vec![UnifiedServerEvent::Close]),
+        };
+
+        match serde_json::from_str::<ServerMessage>(&text) {
+            Ok(gemini_msg) => {
+                let mut unified_events = Vec::new();
+                if gemini_msg.setup_complete.is_some() {
+                    unified_events.push(UnifiedServerEvent::SetupComplete);
+                }
+
+                if let Some(content) = gemini_msg.server_content {
+                    // ... (rest of Gemini content parsing unchanged, it uses S correctly now) ...
+                    let mut combined_text = String::new();
+                    let mut audio_samples: Option<Vec<i16>> = None;
+
+                    if let Some(turn) = &content.model_turn {
+                        for part in &turn.parts {
+                            if let Some(t) = &part.text {
+                                combined_text.push_str(t);
+                                combined_text.push(' ');
+                            }
+                            if let Some(blob) = &part.inline_data {
+                                if blob.mime_type.starts_with("audio/") {
+                                    match Self::decode_gemini_audio(blob) {
+                                        Ok(samples) => {
+                                            if audio_samples.is_none() {
+                                                audio_samples = Some(Vec::new());
+                                            }
+                                            audio_samples.as_mut().unwrap().extend(samples);
+                                        }
+                                        Err(e) => unified_events.push(UnifiedServerEvent::Error(
+                                            ApiError {
+                                                code: "audio_decode_error".to_string(),
+                                                message: e.to_string(),
+                                                event_id: None,
+                                            },
+                                        )),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let final_text = combined_text.trim();
+                    let text_option = if final_text.is_empty() {
+                        None
+                    } else {
+                        Some(final_text.to_string())
+                    };
+
+                    if text_option.is_some() || audio_samples.is_some() {
+                        unified_events.push(UnifiedServerEvent::ContentUpdate {
+                            text: text_option,
+                            audio: audio_samples,
+                            done: false,
+                        });
+                    }
+
+                    if let Some(transcription) = content.output_transcription {
+                        unified_events.push(UnifiedServerEvent::TranscriptionUpdate {
+                            text: transcription.text,
+                            done: true,
+                        });
+                    }
+
+                    if content.turn_complete {
+                        unified_events.push(UnifiedServerEvent::ModelTurnComplete);
+                    }
+                    if content.generation_complete {
+                        unified_events.push(UnifiedServerEvent::ModelGenerationComplete);
+                    }
+                }
+
+                if let Some(tool_call_data) = gemini_msg.tool_call {
+                    let mut responses_to_send = Vec::new();
+                    for func_call in tool_call_data.function_calls {
+                        let call_id = func_call.id.clone();
+                        let call_name = func_call.name.clone();
+                        let args_value = func_call.args.clone().unwrap_or(Value::Null);
+
+                        unified_events.push(UnifiedServerEvent::ToolCall {
+                            id: call_id.clone(),
+                            name: call_name.clone(),
+                            args: args_value.clone(),
+                        });
+
+                        if let Some(handler) = handlers.tool_handlers.get(&call_name) {
+                            let handler_clone = handler.clone();
+                            let state_clone = state.clone();
+                            match handler_clone.call(Some(args_value), state_clone).await {
+                                Ok(response_data) => {
+                                    responses_to_send.push(FunctionResponse {
+                                        id: call_id,
+                                        name: call_name,
+                                        response: response_data,
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!("Tool handler '{}' failed: {}", call_name, e);
+                                    responses_to_send.push(FunctionResponse {
+                                        id: call_id,
+                                        name: call_name,
+                                        response: json!({"error": e}),
+                                    });
+                                }
+                            }
+                        } else {
+                            warn!("No handler registered for tool: {}", call_name);
+                            responses_to_send.push(FunctionResponse {
+                                id: call_id,
+                                name: call_name,
+                                response: json!({"error": "Function not implemented by client."}),
+                            });
+                        }
+                    }
+                    if !responses_to_send.is_empty() {
+                        let num_responses = responses_to_send.len();
+                        match <Self as LiveApiBackend<S>>::build_tool_response_message(
+                            self,
+                            responses_to_send,
+                        ) {
+                            Ok(json_msg) => {
+                                let mut sink = ws_sink.lock().await;
+                                if let Err(e) = sink.send(Message::Text(json_msg.into())).await {
+                                    error!("Failed to send tool response(s): {}", e);
+                                } else {
+                                    info!("Sent {} tool response(s).", num_responses);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to build tool response message: {}", e);
+                            }
+                        }
+                    }
+                }
+                if let Some(metadata) = gemini_msg.usage_metadata {
+                    unified_events.push(UnifiedServerEvent::UsageMetadata(metadata));
+                }
+                if gemini_msg.go_away.is_some() {
+                    warn!("Received GoAway message from Gemini server.");
+                    unified_events.push(UnifiedServerEvent::Close);
+                }
+                Ok(unified_events)
+            }
+            Err(e) => {
+                error!("Failed to parse Gemini ServerMessage: {}", e);
+                trace!("Raw Gemini message: {}", text);
+                Err(GeminiError::DeserializationError(e.to_string()))
+            }
+        }
+    }
+}
+--- src/client/handle.rs ---
+// src/client/handle.rs
+use super::backend::{ApiProvider, BackendConfig, LiveApiBackend};
+use crate::error::GeminiError;
+use crate::types::*;
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, info, trace, warn};
+
+//=========== RENAMED HERE ===========
+pub struct AiLiveClient<S: Clone + Send + Sync + 'static, B: LiveApiBackend<S>> {
+    //====================================
+    pub(crate) shutdown_tx: Option<oneshot::Sender<()>>,
+    pub(crate) outgoing_sender: Option<mpsc::Sender<String>>,
+    pub(crate) state: Arc<S>,
+    pub(crate) backend: Arc<B>,
+    pub(crate) backend_config: BackendConfig,
+}
+
+//=========== RENAMED HERE ===========
+impl<S: Clone + Send + Sync + 'static, B: LiveApiBackend<S>> AiLiveClient<S, B> {
+    //====================================
+
+    pub async fn close(&mut self) -> Result<(), GeminiError> {
+        // ... (unchanged)
+        info!("Client close requested.");
+        if let Some(tx) = self.shutdown_tx.take() {
+            if tx.send(()).is_err() {
+                debug!("Shutdown signal send failed: Listener task likely already stopped.");
+            } else {
+                info!("Shutdown signal sent to listener task.");
+            }
+        }
+        self.outgoing_sender.take();
+        info!("Client resources released.");
+        Ok(())
+    }
+
+    async fn send_raw_message(&self, json_message: String) -> Result<(), GeminiError> {
+        // ... (unchanged)
+        if let Some(sender) = &self.outgoing_sender {
+            trace!("Queueing message for sending: {}", json_message);
+            sender.send(json_message).await.map_err(|e| {
+                error!("Failed to send message to listener task: {}", e);
+                GeminiError::SendError
+            })
+        } else {
+            error!("Cannot send message: Client is closed or sender missing.");
+            Err(GeminiError::NotReady)
+        }
+    }
+
+    pub async fn send_text_turn(&self, text: String) -> Result<(), GeminiError> {
+        // ... (unchanged)
+        info!("Sending text turn: '{}'", text);
+        let message = self.backend.build_text_turn_message(text)?;
+        self.send_raw_message(message).await?;
+        if self.backend.provider_type() == ApiProvider::OpenAi {
+            debug!("Requesting response from OpenAI after text turn.");
+            self.request_response().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_audio_chunk(
+        &self,
+        audio_samples: &[i16],
+        sample_rate: u32,
+    ) -> Result<(), GeminiError> {
+        // ... (unchanged)
+        if audio_samples.is_empty() {
+            warn!("Attempted to send empty audio chunk.");
+            return Ok(());
+        }
+        trace!(
+            "Sending audio chunk: {} samples, {} Hz",
+            audio_samples.len(),
+            sample_rate
+        );
+        let message = self.backend.build_audio_chunk_message(
+            audio_samples,
+            sample_rate,
+            &self.backend_config,
+        )?;
+        self.send_raw_message(message).await
+    }
+
+    pub async fn send_audio_stream_end(&self) -> Result<(), GeminiError> {
+        // ... (unchanged)
+        info!("Sending audio stream end signal.");
+        let message = self.backend.build_audio_stream_end_message()?;
+        self.send_raw_message(message).await?;
+        if self.backend.provider_type() == ApiProvider::OpenAi {
+            debug!("Requesting response from OpenAI after audio stream end.");
+            self.request_response().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_tool_responses(
+        &self,
+        responses: Vec<FunctionResponse>,
+    ) -> Result<(), GeminiError> {
+        // ... (unchanged)
+        info!("Sending {} tool response(s).", responses.len());
+        let message = self.backend.build_tool_response_message(responses)?;
+        self.send_raw_message(message).await?;
+        if self.backend.provider_type() == ApiProvider::OpenAi {
+            debug!("Requesting response from OpenAI after tool response.");
+            self.request_response().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn request_response(&self) -> Result<(), GeminiError> {
+        // ... (unchanged)
+        if self.backend.provider_type() == ApiProvider::OpenAi {
+            debug!("Sending explicit response request.");
+            let message = self.backend.build_request_response_message()?;
+            self.send_raw_message(message).await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn state(&self) -> Arc<S> {
+        // ... (unchanged)
+        self.state.clone()
+    }
+
+    pub fn provider(&self) -> ApiProvider {
+        // ... (unchanged)
+        self.backend.provider_type()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.shutdown_tx.is_none()
+    }
+}
+
+//=========== RENAMED HERE ===========
+impl<S: Clone + Send + Sync + 'static, B: LiveApiBackend<S>> Drop for AiLiveClient<S, B> {
+    //====================================
+    fn drop(&mut self) {
+        if self.shutdown_tx.is_some() {
+            warn!("AiLiveClient dropped without explicit close(). Attempting shutdown."); // Updated name
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            self.outgoing_sender.take();
+        }
+    }
+}
+--- src/client/handlers.rs ---
+use crate::types::UsageMetadata;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::Arc;
+// AppState trait removed
+
+#[derive(Debug, Clone)]
+pub struct ServerContentContext {
+    pub text: Option<String>,
+    pub audio: Option<Vec<i16>>,
+    pub is_done: bool,
+}
+#[derive(Debug, Clone)]
+pub struct UsageMetadataContext {
+    pub metadata: UsageMetadata,
+}
+
+// SClient now uses S directly, with bounds
+pub trait EventHandlerSimple<Args, S: Clone + Send + Sync + 'static>:
+    Send + Sync + 'static
+{
+    fn call(&self, args: Args, state: Arc<S>)
+    -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+}
+
+impl<F, Fut, Args, S> EventHandlerSimple<Args, S> for F
+where
+    F: Fn(Args, Arc<S>) -> Fut + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    Args: Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    fn call(
+        &self,
+        args: Args,
+        state: Arc<S>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        Box::pin(self(args, state))
+    }
+}
+
+// SClient now uses S directly, with bounds
+pub trait ToolHandler<S: Clone + Send + Sync + 'static>: Send + Sync + 'static {
+    fn call(
+        &self,
+        args: Option<Value>,
+        state: Arc<S>,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'static>>;
+}
+
+impl<F, Fut, S> ToolHandler<S> for F
+where
+    F: Fn(Option<Value>, Arc<S>) -> Fut + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value, String>> + Send + 'static,
+{
+    fn call(
+        &self,
+        args: Option<Value>,
+        state: Arc<S>,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'static>> {
+        Box::pin(self(args, state))
+    }
+}
+
+// Handlers is now generic over S
+pub(crate) struct Handlers<S: Clone + Send + Sync + 'static> {
+    pub(crate) on_server_content: Option<Arc<dyn EventHandlerSimple<ServerContentContext, S>>>,
+    pub(crate) on_usage_metadata: Option<Arc<dyn EventHandlerSimple<UsageMetadataContext, S>>>,
+    pub(crate) tool_handlers: HashMap<String, Arc<dyn ToolHandler<S>>>,
+    _phantom_s: PhantomData<S>, // PhantomData uses S directly
+}
+
+impl<S: Clone + Send + Sync + 'static> Default for Handlers<S> {
+    fn default() -> Self {
+        Self {
+            on_server_content: None,
+            on_usage_metadata: None,
+            tool_handlers: HashMap::new(),
+            _phantom_s: PhantomData,
+        }
+    }
+}
+--- src/client/mod.rs ---
+// src/client/mod.rs
+// Modules for internal organization
+mod backend;
+pub mod builder;
+mod connection;
+pub mod gemini_backend;
+pub mod handle;
+pub mod handlers;
+pub mod openai_backend;
+
+// Re-export necessary public types
+pub use backend::{ApiError, ApiProvider, BackendConfig, UnifiedServerEvent};
+pub use builder::AiClientBuilder;
+pub use handle::AiLiveClient; // Corrected from GeminiLiveClient
+pub use handlers::{ServerContentContext, ToolHandler, UsageMetadataContext};
+--- src/client/openai_backend.rs ---
+// src/client/openai_backend.rs
+use super::backend::*;
+use crate::client::handlers::Handlers;
+use crate::error::GeminiError;
+use crate::types::{FunctionResponse, UsageMetadata};
+use async_trait::async_trait;
+use base64::Engine as _;
+use futures_util::SinkExt;
+use http::header;
+use serde_json::{Value, json};
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest; // For request manipulation
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tracing::{debug, error, info, trace, warn};
+
+pub struct OpenAiBackend;
+
+impl OpenAiBackend {
+    fn decode_openai_audio(
+        /* ... unchanged ... */
+        b64_data: &str,
+        format: &Option<String>,
+    ) -> Result<Vec<i16>, GeminiError> {
+        let format_str = format.as_deref().unwrap_or("pcm16");
+        if format_str != "pcm16" {
+            return Err(GeminiError::UnsupportedOperation(format!(
+                "Audio decoding for format '{}' not yet implemented for OpenAI",
+                format_str
+            )));
+        }
+        match base64::engine::general_purpose::STANDARD.decode(b64_data) {
+            Ok(decoded_bytes) => {
+                if decoded_bytes.len() % 2 != 0 {
+                    warn!("Decoded OpenAI audio data has odd number of bytes.");
+                }
+                let samples = decoded_bytes
+                    .chunks_exact(2)
+                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+                Ok(samples)
+            }
+            Err(e) => Err(GeminiError::DeserializationError(format!(
+                "Base64 decode failed: {}",
+                e
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl<S: Clone + Send + Sync + 'static> LiveApiBackend<S> for OpenAiBackend {
+    fn provider_type(&self) -> ApiProvider {
+        ApiProvider::OpenAi
+    }
+
+    fn get_websocket_url(&self, _api_key: &str) -> Result<url::Url, GeminiError> {
+        // The model parameter will be added to the request URI.
+        let url_str = "wss://api.openai.com/v1/realtime";
+        url::Url::parse(url_str)
+            .map_err(|e| GeminiError::ConfigurationError(format!("Invalid OpenAI URL: {}", e)))
+    }
+
+    fn configure_websocket_request(
+        &self,
+        api_key: &str,
+        _base_request_ignored: http::Request<()>, // We'll build from scratch using tungstenite's types
+        config: &BackendConfig,
+    ) -> Result<http::Request<()>, GeminiError> {
+        let model_query = format!("model={}", config.model);
+        let uri_str = format!("wss://api.openai.com/v1/realtime?{}", model_query);
+
+        // Use tungstenite's IntoClientRequest to build the request.
+        // This ensures that tungstenite itself can properly process it and add necessary handshake headers.
+        let mut request = uri_str.into_client_request()?;
+
+        // Add OpenAI specific headers to the tungstenite Request's headers
+        let headers = request.headers_mut();
+        headers.append(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_str(&format!("Bearer {}", api_key)).map_err(|e| {
+                GeminiError::ConfigurationError(format!(
+                    "Invalid API key format for Authorization header: {}",
+                    e
+                ))
+            })?,
+        );
+        headers.append(
+            "OpenAI-Beta",
+            header::HeaderValue::from_static("realtime=v1"),
+        );
+        // The Host header is derived by into_client_request from the URI.
+        // Standard WebSocket headers (Upgrade, Connection, Sec-WebSocket-Key, Sec-WebSocket-Version)
+        // will be added by the tungstenite library when it performs the handshake.
+
+        trace!(
+            "Constructed OpenAI WebSocket request (via tungstenite): Headers: {:?}",
+            request.headers()
+        );
+
+        // Convert tungstenite::handshake::client::Request to http::Request<()>
+        // This part is a bit manual if IntoClientRequest doesn't directly give http::Request
+        // but tokio_tungstenite::connect_async takes U: IntoClientRequest + Unpin,
+        // so we can pass the tungstenite::handshake::client::Request directly.
+
+        // However, the `connect_async` in `connection.rs` expects `http::Request<()>`.
+        // We need to bridge this. The `IntoClientRequest` trait has a method:
+        // fn into_client_request(self) -> Result<Request, Error>;
+        // where `Request` is `tungstenite::handshake::client::Request`.
+        // And `tungstenite::handshake::client::Request` can be converted to `http::Request`.
+        //
+        // Let's ensure the request object passed to connect_async in connection.rs
+        // is what tokio-tungstenite expects to correctly add its own headers.
+        // The simplest way is to pass the URL string and let `connect_async` build the http::Request,
+        // then use a connector to add custom headers.
+        //
+        // If we must return http::Request from here for the current connection.rs structure:
+        let http_request = http::Request::builder()
+            .method(request.method().clone())
+            .uri(request.uri().clone())
+            .version(http::Version::HTTP_11); // Or request.version() if available and correct type
+
+        let mut final_request = http_request.body(()).map_err(GeminiError::HttpError)?;
+
+        // Copy headers from tungstenite's request to http::Request
+        for (name, value) in request.headers() {
+            final_request
+                .headers_mut()
+                .append(name.clone(), value.clone());
+        }
+
+        Ok(final_request)
+    }
+
+    async fn get_initial_messages(
+        /* ... unchanged ... */
+        &self,
+        config: &BackendConfig,
+    ) -> Result<Vec<String>, GeminiError> {
+        Ok(vec![
+            <Self as LiveApiBackend<S>>::build_session_update_message(self, config)?,
+        ])
+    }
+
+    fn build_session_update_message(&self, config: &BackendConfig) -> Result<String, GeminiError> {
+        let mut session_data = serde_json::Map::new();
+        if let Some(instr) = &config.system_instruction {
+            if let Some(part) = instr.parts.first() {
+                if let Some(text) = &part.text {
+                    session_data.insert("instructions".to_string(), Value::String(text.clone()));
+                }
+            }
+        }
+        if !config.tools.is_empty() {
+            let openai_tools = config
+                .tools
+                .iter()
+                .map(|t| t.openai_definition.clone()) // This is where the tool defs from the macro are used
+                .collect::<Vec<_>>();
+            session_data.insert("tools".to_string(), Value::Array(openai_tools));
+            session_data.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+        }
+        // ... (rest of the fields like voice, audio_format, transcription, generation_config etc.)
+
+        let payload = json!({ "type": "session.update", "session": Value::Object(session_data) });
+        let json_string = serde_json::to_string(&payload)?;
+
+        // <<< ADD THIS LOGGING >>>
+        info!(
+            "[OpenAI Backend] Sending session.update message: {}",
+            json_string
+        );
+        // <<< END LOGGING >>>
+
+        Ok(json_string)
+    }
+
+    fn build_text_turn_message(&self, text: String) -> Result<String, GeminiError> {
+        serde_json::to_string(&json!({ "type": "conversation.item.create", "item": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] }})).map_err(GeminiError::from)
+    }
+    fn build_audio_chunk_message(
+        &self,
+        audio_samples: &[i16],
+        _sample_rate: u32,
+        config: &BackendConfig,
+    ) -> Result<String, GeminiError> {
+        if audio_samples.is_empty() {
+            return Err(GeminiError::ConfigurationError(
+                "Audio samples cannot be empty".to_string(),
+            ));
+        }
+        let format_str = config.input_audio_format.as_deref().unwrap_or("pcm16");
+        if format_str != "pcm16" {
+            return Err(GeminiError::UnsupportedOperation(format!(
+                "Audio encoding for format '{}' not yet implemented for OpenAI",
+                format_str
+            )));
+        }
+        let mut byte_data = Vec::with_capacity(audio_samples.len() * 2);
+        for sample in audio_samples {
+            byte_data.extend_from_slice(&sample.to_le_bytes());
+        }
+        let encoded_data = base64::engine::general_purpose::STANDARD.encode(&byte_data);
+        serde_json::to_string(
+            &json!({ "type": "input_audio_buffer.append", "audio": encoded_data }),
+        )
+        .map_err(GeminiError::from)
+    }
+    fn build_audio_stream_end_message(&self) -> Result<String, GeminiError> {
+        serde_json::to_string(&json!({ "type": "input_audio_buffer.commit" }))
+            .map_err(GeminiError::from)
+    }
+    fn build_tool_response_message(
+        &self,
+        responses: Vec<FunctionResponse>,
+    ) -> Result<String, GeminiError> {
+        if let Some(response) = responses.first() {
+            let output_string = match serde_json::to_string(&response.response) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "Failed to serialize tool response value: {}. Sending as error string.",
+                        e
+                    );
+                    json!({ "error": format!("Failed to serialize response: {}", e) }).to_string()
+                }
+            };
+            serde_json::to_string(&json!({ "type": "conversation.item.create", "item": { "type": "function_call_output", "call_id": response.id, "output": output_string }})).map_err(GeminiError::from)
+        } else {
+            Err(GeminiError::ConfigurationError(
+                "No tool responses provided for OpenAI".to_string(),
+            ))
+        }
+    }
+    fn build_request_response_message(&self) -> Result<String, GeminiError> {
+        serde_json::to_string(&json!({ "type": "response.create", "response": {}}))
+            .map_err(GeminiError::from)
+    }
+
+    async fn parse_server_message(
+        /* ... unchanged, ensure Message::Binary(b_vec) is correct ... */
+        &self,
+        message: Message,
+        handlers: &Arc<Handlers<S>>,
+        state: &Arc<S>,
+        ws_sink: &Arc<TokioMutex<WsSink>>,
+        output_audio_format: &Option<String>,
+    ) -> Result<Vec<UnifiedServerEvent>, GeminiError> {
+        let text = match message {
+            Message::Text(t_str) => t_str.to_string(),
+            Message::Binary(b_vec) => String::from_utf8(b_vec.to_vec())
+                .map_err(|e| {
+                    GeminiError::DeserializationError(format!(
+                        "Invalid UTF-8 in binary message: {}",
+                        e
+                    ))
+                })?
+                .to_string(),
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(vec![]),
+            Message::Close(_) => return Ok(vec![UnifiedServerEvent::Close]),
+        };
+
+        match serde_json::from_str::<Value>(&text) {
+            Ok(openai_event) => {
+                let event_type = openai_event.get("type").and_then(|v| v.as_str());
+                let mut unified_events = Vec::new();
+                let event_id = openai_event
+                    .get("event_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                trace!(
+                    "Received OpenAI event: {:?}, content: {}",
+                    event_type,
+                    openai_event.to_string()
+                );
+
+                match event_type {
+                    Some("session.created") | Some("session.updated") => {
+                        unified_events.push(UnifiedServerEvent::SetupComplete);
+                    }
+                    Some("response.created") => {
+                        debug!("OpenAI response generation started.");
+                    }
+                    Some("response.text.delta") => {
+                        let delta = openai_event
+                            .get("delta")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !delta.is_empty() {
+                            unified_events.push(UnifiedServerEvent::ContentUpdate {
+                                text: Some(delta),
+                                audio: None,
+                                done: false,
+                            });
+                        }
+                    }
+                    Some("response.audio.delta") => {
+                        if let Some(audio_b64) = openai_event.get("delta").and_then(|v| v.as_str())
+                        {
+                            match Self::decode_openai_audio(audio_b64, output_audio_format) {
+                                Ok(samples) => {
+                                    if !samples.is_empty() {
+                                        unified_events.push(UnifiedServerEvent::ContentUpdate {
+                                            text: None,
+                                            audio: Some(samples),
+                                            done: false,
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    unified_events.push(UnifiedServerEvent::Error(ApiError {
+                                        code: "audio_decode_error".to_string(),
+                                        message: e.to_string(),
+                                        event_id,
+                                    }))
+                                }
+                            }
+                        }
+                    }
+                    Some("conversation.item.input_audio_transcription.delta") => {
+                        let delta = openai_event
+                            .get("delta")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !delta.is_empty() {
+                            unified_events.push(UnifiedServerEvent::TranscriptionUpdate {
+                                text: delta,
+                                done: false,
+                            });
+                        }
+                    }
+                    Some("conversation.item.input_audio_transcription.completed") => {
+                        let transcript = openai_event
+                            .get("transcript")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        unified_events.push(UnifiedServerEvent::TranscriptionUpdate {
+                            text: transcript,
+                            done: true,
+                        });
+                    }
+                    Some("response.done") => {
+                        if let Some(outputs) = openai_event
+                            .get("response")
+                            .and_then(|r| r.get("output"))
+                            .and_then(|o| o.as_array())
+                        {
+                            for output in outputs {
+                                if output.get("type").and_then(|t| t.as_str())
+                                    == Some("function_call")
+                                {
+                                    let name = output
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let args_str = output
+                                        .get("arguments")
+                                        .and_then(|a| a.as_str())
+                                        .unwrap_or("{}");
+                                    let call_id = output
+                                        .get("call_id")
+                                        .and_then(|id| id.as_str())
+                                        .map(String::from);
+                                    match serde_json::from_str::<Value>(args_str) {
+                                        Ok(args_value) => {
+                                            unified_events.push(UnifiedServerEvent::ToolCall {
+                                                id: call_id.clone(),
+                                                name: name.clone(),
+                                                args: args_value.clone(),
+                                            });
+                                            if let Some(handler) = handlers.tool_handlers.get(&name)
+                                            {
+                                                let handler_clone = handler.clone();
+                                                let state_clone = state.clone();
+                                                match handler_clone
+                                                    .call(Some(args_value), state_clone)
+                                                    .await
+                                                {
+                                                    Ok(response_data) => {
+                                                        match <Self as LiveApiBackend<S>>::build_tool_response_message(self, vec![FunctionResponse { id: call_id.clone(), name: name.clone(), response: response_data }]) {
+                                                            Ok(json_msg) => { let mut sink = ws_sink.lock().await;
+                                                                if sink.send(Message::Text(json_msg.into())).await.is_ok() {
+                                                                    if let Ok(req_resp_msg) = <Self as LiveApiBackend<S>>::build_request_response_message(self) {
+                                                                        let _ = sink.send(Message::Text(req_resp_msg.into())).await; info!("Sent tool response and requested next response for '{}'.", name);
+                                                                    } else { error!("Failed to build request_response message after tool call."); }
+                                                                } else { error!("Failed to send tool response for '{}'.", name); }
+                                                            } Err(e) => error!("Failed to build tool response message for '{}': {}", name, e),
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Tool handler '{}' failed: {}",
+                                                            name, e
+                                                        );
+                                                        match <Self as LiveApiBackend<S>>::build_tool_response_message(self, vec![FunctionResponse { id: call_id.clone(), name: name.clone(), response: json!({"error": e}) }]) {
+                                                            Ok(json_msg) => { let mut sink = ws_sink.lock().await;
+                                                                if sink.send(Message::Text(json_msg.into())).await.is_ok() {
+                                                                    if let Ok(req_resp_msg) = <Self as LiveApiBackend<S>>::build_request_response_message(self) {
+                                                                        let _ = sink.send(Message::Text(req_resp_msg.into())).await; info!("Sent tool error response and requested next response for '{}'.", name);
+                                                                    } else { error!("Failed to build request_response message after tool error."); }
+                                                                } else { error!("Failed to send tool error response for '{}'.", name); }
+                                                            } Err(e) => error!("Failed to build tool error response message for '{}': {}", name, e),
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                warn!("No handler registered for tool: {}", name);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to parse tool arguments for '{}': {}",
+                                                name, e
+                                            );
+                                            unified_events.push(UnifiedServerEvent::Error(
+                                                ApiError {
+                                                    code: "tool_args_parse_error".to_string(),
+                                                    message: format!(
+                                                        "Failed to parse args for {}: {}",
+                                                        name, e
+                                                    ),
+                                                    event_id: None,
+                                                },
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        unified_events.push(UnifiedServerEvent::ContentUpdate {
+                            text: None,
+                            audio: None,
+                            done: true,
+                        });
+                        unified_events.push(UnifiedServerEvent::ModelTurnComplete);
+                        unified_events.push(UnifiedServerEvent::ModelGenerationComplete);
+                    }
+                    Some("error") => {
+                        let code = openai_event
+                            .get("code")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let message = openai_event
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        unified_events.push(UnifiedServerEvent::Error(ApiError {
+                            code,
+                            message,
+                            event_id,
+                        }));
+                    }
+                    Some("rate_limits.updated") => {
+                        if let Some(usage_val) =
+                            openai_event.get("response").and_then(|r| r.get("usage"))
+                        {
+                            match serde_json::from_value::<UsageMetadata>(usage_val.clone()) {
+                                Ok(mut metadata) => {
+                                    metadata.prompt_token_count = usage_val
+                                        .get("input_tokens")
+                                        .and_then(|v| v.as_i64())
+                                        .map(|v| v as i32);
+                                    metadata.response_token_count = usage_val
+                                        .get("output_tokens")
+                                        .and_then(|v| v.as_i64())
+                                        .map(|v| v as i32);
+                                    metadata.total_token_count = usage_val
+                                        .get("total_tokens")
+                                        .and_then(|v| v.as_i64())
+                                        .map(|v| v as i32);
+                                    unified_events.push(UnifiedServerEvent::UsageMetadata(metadata))
+                                }
+                                Err(e) => warn!("Failed to parse OpenAI usage metadata: {}", e),
+                            }
+                        }
+                    }
+                    Some(
+                        other_type @ ("input_audio_buffer.speech_started"
+                        | "input_audio_buffer.speech_stopped"
+                        | "input_audio_buffer.committed"
+                        | "input_audio_buffer.cleared"),
+                    ) => {
+                        debug!("Received audio buffer event: {}", other_type);
+                    }
+                    Some(other_type) => {
+                        debug!("Received unhandled OpenAI event type: {}", other_type);
+                        unified_events
+                            .push(UnifiedServerEvent::ProviderSpecific(openai_event.clone()));
+                    }
+                    None => {
+                        warn!("Received OpenAI message without a 'type' field: {}", text);
+                    }
+                }
+                Ok(unified_events)
+            }
+            Err(e) => {
+                error!("Failed to parse OpenAI message JSON: {}", e);
+                trace!("Raw OpenAI message: {}", text);
+                Err(GeminiError::DeserializationError(e.to_string()))
+            }
+        }
+    }
+}
+--- src/error.rs ---
+use thiserror::Error;
+use tokio_tungstenite::tungstenite;
+
+#[derive(Error, Debug)]
+pub enum GeminiError {
+    #[error("WebSocket connection error: {0}")]
+    WebSocketError(#[from] tungstenite::Error),
+
+    #[error("JSON serialization/deserialization error: {0}")]
+    SerdeError(#[from] serde_json::Error),
+
+    #[error("I/O error: {0}")] // Keep for potential file ops later?
+    IoError(#[from] std::io::Error),
+
+    #[error("API communication error: {0}")] // More general API error
+    ApiError(String),
+
+    #[error("Configuration error: {0}")] // Added for setup issues
+    ConfigurationError(String),
+
+    #[error("Connection not established or setup not complete")]
+    NotReady,
+
+    #[error("Message from server was not in expected format")]
+    UnexpectedMessage, // May be less relevant with specific backend parsing
+
+    #[error("Attempted to send message on a closed connection")]
+    ConnectionClosed,
+
+    #[error("Function call handler not found for: {0}")]
+    FunctionHandlerNotFound(String), // Keep for tool handling
+
+    #[error("Error sending message to internal task: Channel closed")] // Clarified SendError
+    SendError,
+
+    #[error("Missing API key")]
+    MissingApiKey, // Keep for initial setup
+
+    #[error("Feature or operation not supported by the selected backend: {0}")] // Added
+    UnsupportedOperation(String),
+
+    #[error("Error during message deserialization: {0}")] // Added for specific parsing issues
+    DeserializationError(String),
+
+    #[error("HTTP error during connection setup: {0}")] // Added for HTTP errors
+    HttpError(#[from] http::Error),
+
+    #[error("URL parsing error: {0}")] // Added for URL errors
+    UrlError(#[from] url::ParseError),
+}
+--- src/lib.rs ---
+pub mod client;
+pub mod error;
+pub mod types;
+
+pub use client::{
+    AiClientBuilder, // Renamed
+    AiLiveClient,    // Renamed
+    ApiProvider,
+    ServerContentContext,
+    ToolHandler,
+    UsageMetadataContext,
+};
+pub use error::GeminiError;
+pub use gemini_live_macros::tool_function;
+pub use types::{
+    Content, FunctionDeclaration, FunctionResponse, GenerationConfig, Part, RealtimeInputConfig,
+    ResponseModality, Role, Schema, SpeechConfig, SpeechLanguageCode, Tool, UsageMetadata,
+};
+--- src/types.rs ---
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
+use std::collections::HashMap;
+
+// --- Enums ---
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpeechLanguageCode {
+    #[serde(rename = "en-US")]
+    EnglishUS,
+    #[serde(rename = "en-GB")]
+    EnglishGB,
+    #[serde(rename = "en-AU")]
+    EnglishAU,
+    #[serde(rename = "en-IN")]
+    EnglishIN,
+    #[serde(rename = "es-ES")]
+    SpanishES,
+    #[serde(rename = "es-US")]
+    SpanishUS,
+    #[serde(rename = "de-DE")]
+    GermanDE,
+    #[serde(rename = "fr-FR")]
+    FrenchFR,
+    #[serde(rename = "fr-CA")]
+    FrenchCA,
+    #[serde(rename = "hi-IN")]
+    HindiIN,
+    #[serde(rename = "pt-BR")]
+    PortugueseBR,
+    #[serde(rename = "ar-XA")]
+    ArabicXA,
+    #[serde(rename = "id-ID")]
+    IndonesianID,
+    #[serde(rename = "it-IT")]
+    ItalianIT,
+    #[serde(rename = "ja-JP")]
+    JapaneseJP,
+    #[serde(rename = "tr-TR")]
+    TurkishTR,
+    #[serde(rename = "vi-VN")]
+    VietnameseVN,
+    #[serde(rename = "bn-IN")]
+    BengaliIN,
+    #[serde(rename = "gu-IN")]
+    GujaratiIN,
+    #[serde(rename = "kn-IN")]
+    KannadaIN,
+    #[serde(rename = "ml-IN")]
+    MalayalamIN,
+    #[serde(rename = "mr-IN")]
+    MarathiIN,
+    #[serde(rename = "ta-IN")]
+    TamilIN,
+    #[serde(rename = "te-IN")]
+    TeluguIN,
+    #[serde(rename = "nl-NL")]
+    DutchNL,
+    #[serde(rename = "ko-KR")]
+    KoreanKR,
+    #[serde(rename = "cmn-CN")]
+    MandarinCN,
+    #[serde(rename = "pl-PL")]
+    PolishPL,
+    #[serde(rename = "ru-RU")]
+    RussianRU,
+    #[serde(rename = "th-TH")]
+    ThaiTH,
+    #[serde(untagged)]
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ResponseModality {
+    Text,
+    Audio,
+    Other(String),
+}
+// ***** RESTORED Serialize/Deserialize for ResponseModality *****
+impl Serialize for ResponseModality {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ResponseModality::Text => serializer.serialize_str("TEXT"),
+            ResponseModality::Audio => serializer.serialize_str("AUDIO"),
+            ResponseModality::Other(s) => serializer.serialize_str(s),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ResponseModality {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "TEXT" => Ok(ResponseModality::Text),
+            "AUDIO" => Ok(ResponseModality::Audio),
+            other => Ok(ResponseModality::Other(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)] // Removed Default derive
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    #[default] // Keep default on User
+    User,
+    Model,
+    Function,
+    System,
+    #[serde(untagged)]
+    Other(String),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActivityHandling {
+    ActivityHandlingUnspecified,
+    StartOfActivityInterrupts,
+    NoInterruption,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StartSensitivity {
+    StartSensitivityUnspecified,
+    StartSensitivityHigh,
+    StartSensitivityLow,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EndSensitivity {
+    EndSensitivityUnspecified,
+    EndSensitivityHigh,
+    EndSensitivityLow,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TurnCoverage {
+    TurnCoverageUnspecified,
+    TurnIncludesOnlyActivity,
+    TurnIncludesAllInput,
+}
+
+// --- Core Structs ---
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_code: Option<SpeechLanguageCode>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Content {
+    // ***** RESTORED parts field *****
+    pub parts: Vec<Part>,
+    // ***** RESTORED role field *****
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Part {
+    // ***** RESTORED text field *****
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    // ***** RESTORED inline_data field *****
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_data: Option<Blob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<FunctionCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_response: Option<FunctionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable_code: Option<ExecutableCode>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableCode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FunctionCall {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FunctionResponse {
+    pub name: String,
+    pub response: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)] // Keep Serialize for backend usage
+#[serde(rename_all = "camelCase")]
+pub struct Blob {
+    // ***** RESTORED mime_type field *****
+    pub mime_type: String,
+    // ***** RESTORED data field *****
+    pub data: String, // Base64 encoded bytes
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i32>,
+    // ***** RESTORED temperature field *****
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_modalities: Option<Vec<ResponseModality>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech_config: Option<SpeechConfig>,
+    // Add other fields if needed
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Tool {
+    pub function_declarations: Vec<FunctionDeclaration>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FunctionDeclaration {
+    pub name: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Schema>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Schema {
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<HashMap<String, Schema>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTranscriptionConfig {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeInputConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automatic_activity_detection: Option<AutomaticActivityDetection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_handling: Option<ActivityHandling>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_coverage: Option<TurnCoverage>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomaticActivityDetection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_of_speech_sensitivity: Option<StartSensitivity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_padding_ms: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_of_speech_sensitivity: Option<EndSensitivity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silence_duration_ms: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityStart {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEnd {}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_content_token_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_token_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_prompt_token_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thoughts_token_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_token_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_token_details: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_token_details: Option<Value>,
+}
+
+// --- Gemini Specific Internal Structs (Marked pub(crate)) ---
+#[derive(Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BidiGenerateContentSetup {
+    /* ... fields ... */
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_instruction: Option<Content>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime_input_config: Option<RealtimeInputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_resumption: Option<SessionResumptionConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window_compression: Option<ContextWindowCompressionConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_audio_transcription: Option<AudioTranscriptionConfig>,
+}
+#[derive(Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BidiGenerateContentClientContent {
+    /* ... fields ... */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns: Option<Vec<Content>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_complete: Option<bool>,
+}
+#[derive(Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BidiGenerateContentRealtimeInput {
+    /* ... fields ... */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<Blob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<Blob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_start: Option<ActivityStart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_end: Option<ActivityEnd>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_stream_end: Option<bool>,
+}
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ClientMessagePayload {
+    /* ... variants ... */
+    Setup(BidiGenerateContentSetup),
+    ClientContent(BidiGenerateContentClientContent),
+    RealtimeInput(BidiGenerateContentRealtimeInput),
+    ToolResponse(BidiGenerateContentToolResponse),
+}
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BidiGenerateContentToolResponse {
+    /* ... fields ... */
+    pub function_responses: Vec<FunctionResponse>,
+}
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BidiGenerateContentSetupComplete {}
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BidiGenerateContentServerContent {
+    /* ... fields ... */
+    #[serde(default)]
+    pub generation_complete: bool,
+    #[serde(default)]
+    pub turn_complete: bool,
+    #[serde(default)]
+    pub interrupted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grounding_metadata: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_transcription: Option<BidiGenerateContentTranscription>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_turn: Option<Content>,
+}
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BidiGenerateContentTranscription {
+    /* ... fields ... */
+    pub text: String,
+}
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BidiGenerateContentToolCall {
+    /* ... fields ... */
+    pub function_calls: Vec<FunctionCall>,
+}
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BidiGenerateContentToolCallCancellation {
+    /* ... fields ... */
+    pub ids: Vec<String>,
+}
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GoAway {
+    /* ... fields ... */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_left: Option<String>,
+}
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionResumptionUpdate {
+    /* ... fields ... */
+    pub new_handle: String,
+    pub resumable: bool,
+}
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ServerMessage {
+    /* ... fields ... */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_metadata: Option<UsageMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_complete: Option<BidiGenerateContentSetupComplete>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_content: Option<BidiGenerateContentServerContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<BidiGenerateContentToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_cancellation: Option<BidiGenerateContentToolCallCancellation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub go_away: Option<GoAway>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_resumption_update: Option<SessionResumptionUpdate>,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionResumptionConfig {
+    /* ... fields ... */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContextWindowCompressionConfig {
+    /* ... fields ... */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sliding_window: Option<SlidingWindow>,
+    pub trigger_tokens: i64,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SlidingWindow {
+    /* ... fields ... */
+    pub target_tokens: i64,
+}

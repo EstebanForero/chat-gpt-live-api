@@ -1,5 +1,6 @@
 // src/client/openai_backend.rs
 use super::backend::*;
+use crate::ResponseModality;
 use crate::client::handlers::Handlers;
 use crate::error::GeminiError;
 use crate::types::{FunctionResponse, UsageMetadata};
@@ -143,11 +144,39 @@ impl<S: Clone + Send + Sync + 'static> LiveApiBackend<S> for OpenAiBackend {
     }
 
     fn build_session_update_message(&self, config: &BackendConfig) -> Result<String, GeminiError> {
-        let mut session_data = serde_json::Map::new();
+        let mut session_object_map = serde_json::Map::new();
+
+        // Model (already there from your example JSON structure)
+        session_object_map.insert("model".to_string(), Value::String(config.model.clone()));
+
+        // Modalities (already there from your example JSON structure)
+        if let Some(gen_config) = &config.generation_config {
+            if let Some(modalities) = &gen_config.response_modalities {
+                let modalities_str: Vec<String> = modalities
+                    .iter()
+                    .map(|m| match m {
+                        ResponseModality::Text => "text".to_string(),
+                        ResponseModality::Audio => "audio".to_string(),
+                        ResponseModality::Other(s) => s.clone(),
+                    })
+                    .collect();
+                session_object_map.insert("modalities".to_string(), json!(modalities_str));
+            }
+            if let Some(temp) = gen_config.temperature {
+                session_object_map.insert("temperature".to_string(), json!(temp));
+            }
+            if let Some(max_tokens) = gen_config.max_output_tokens {
+                // Assuming this maps to max_response_output_tokens
+                session_object_map
+                    .insert("max_response_output_tokens".to_string(), json!(max_tokens));
+            }
+        }
+
         if let Some(instr) = &config.system_instruction {
             if let Some(part) = instr.parts.first() {
                 if let Some(text) = &part.text {
-                    session_data.insert("instructions".to_string(), Value::String(text.clone()));
+                    session_object_map
+                        .insert("instructions".to_string(), Value::String(text.clone()));
                 }
             }
         }
@@ -155,23 +184,90 @@ impl<S: Clone + Send + Sync + 'static> LiveApiBackend<S> for OpenAiBackend {
             let openai_tools = config
                 .tools
                 .iter()
-                .map(|t| t.openai_definition.clone()) // This is where the tool defs from the macro are used
+                .map(|t| t.openai_definition.clone())
                 .collect::<Vec<_>>();
-            session_data.insert("tools".to_string(), Value::Array(openai_tools));
-            session_data.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+            session_object_map.insert("tools".to_string(), Value::Array(openai_tools));
+            session_object_map.insert("tool_choice".to_string(), Value::String("auto".to_string())); // Or "none" / specific tool
+        } else {
+            // Explicitly add empty tools array and tool_choice: "none" if no tools
+            // to match the example JSON more closely if that's the desired default.
+            session_object_map.insert("tools".to_string(), json!([]));
+            session_object_map.insert("tool_choice".to_string(), Value::String("none".to_string()));
         }
-        // ... (rest of the fields like voice, audio_format, transcription, generation_config etc.)
 
-        let payload = json!({ "type": "session.update", "session": Value::Object(session_data) });
+        if let Some(voice) = &config.voice {
+            session_object_map.insert("voice".to_string(), Value::String(voice.clone()));
+        }
+        if let Some(format) = &config.input_audio_format {
+            session_object_map.insert(
+                "input_audio_format".to_string(),
+                Value::String(format.clone()),
+            );
+        }
+        if let Some(format) = &config.output_audio_format {
+            session_object_map.insert(
+                "output_audio_format".to_string(),
+                Value::String(format.clone()),
+            );
+        }
+
+        // --- NEW: Input Audio Noise Reduction ---
+        if let Some(nr_config) = &config.input_audio_noise_reduction {
+            // OpenAI expects `null` to turn it off, or an object like {"type": "near_field"}
+            if nr_config.r#type.is_some() {
+                session_object_map
+                    .insert("input_audio_noise_reduction".to_string(), json!(nr_config));
+            } else {
+                // If r#type is None in our struct, send null to API to disable it.
+                // Or, if you want to omit the field entirely if type is None, you can do that.
+                // The example shows `null`, so let's go with that if type is not specified.
+                // However, the doc says "This can be set to null to turn off."
+                // So if nr_config exists but type is None, it means "configure it, but as off".
+                // If nr_config itself is None, the field is omitted (OpenAI uses default).
+                session_object_map.insert("input_audio_noise_reduction".to_string(), Value::Null);
+            }
+        }
+
+        // --- NEW: Audio Transcription Config ---
+        if let Some(trans_config) = &config.output_audio_transcription {
+            let mut trans_map = serde_json::Map::new();
+            if let Some(model) = &trans_config.model {
+                trans_map.insert("model".to_string(), json!(model));
+            }
+            if let Some(lang) = &trans_config.language {
+                trans_map.insert("language".to_string(), json!(lang));
+            }
+            if let Some(prompt) = &trans_config.prompt {
+                trans_map.insert("prompt".to_string(), json!(prompt));
+            }
+            if !trans_map.is_empty() {
+                session_object_map.insert(
+                    "input_audio_transcription".to_string(),
+                    Value::Object(trans_map),
+                );
+            } else {
+                // If the AudioTranscriptionConfig is present but all its fields are None,
+                // OpenAI might interpret an empty object {} as "default on" or an error.
+                // The example shows it being present if configured. If you want to disable, send null.
+                // For simplicity, if all fields are None, we could omit `input_audio_transcription`
+                // or send `null` if AudioTranscriptionConfig was explicitly set to default.
+                // Let's assume if AudioTranscriptionConfig is Some(), we send the object, even if empty.
+                // Or to match example `null`:
+                // session_object_map.insert("input_audio_transcription".to_string(), Value::Null);
+            }
+        }
+
+        // The main `session` object in the payload
+        let payload = json!({
+            "type": "session.update",
+            "session": Value::Object(session_object_map) // Use the map we built
+        });
         let json_string = serde_json::to_string(&payload)?;
 
-        // <<< ADD THIS LOGGING >>>
         info!(
             "[OpenAI Backend] Sending session.update message: {}",
             json_string
         );
-        // <<< END LOGGING >>>
-
         Ok(json_string)
     }
 

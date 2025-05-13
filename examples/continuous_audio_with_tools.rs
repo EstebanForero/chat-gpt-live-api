@@ -370,7 +370,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder = builder.input_audio_format("pcm16".to_string());
     builder = builder.output_audio_format("pcm16".to_string());
 
-    builder = builder.output_audio_transcription(AudioTranscriptionConfig {});
+    builder = builder.output_audio_transcription(AudioTranscriptionConfig {
+        model: None,
+        language: Some("en".to_string()),
+        prompt: None
+    });
     builder = builder.system_instruction(Content {
         parts: vec![Part {
             text: Some(

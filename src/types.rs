@@ -2,6 +2,21 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")] // Ensure snake_case for "near_field", "far_field"
+pub enum NoiseReductionType {
+    NearField,
+    FarField,
+    // You might add Unspecified or Off if the API supports it as a string value
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InputAudioNoiseReduction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<NoiseReductionType>, // Use r#type because 'type' is a keyword
+                                            // Add other noise reduction params here if OpenAI adds them
+}
 // --- Enums ---
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -272,7 +287,15 @@ pub struct Schema {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct AudioTranscriptionConfig {}
+pub struct AudioTranscriptionConfig {
+    // This struct was empty, let's add OpenAI specific fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>, // e.g., "whisper-1"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>, // e.g., "es"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]

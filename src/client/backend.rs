@@ -70,6 +70,7 @@ pub struct BackendConfig {
     pub transcription_language: Option<String>,
     pub transcription_prompt: Option<String>,
     pub include_logprobs: bool,
+    pub input_audio_noise_reduction: Option<InputAudioNoiseReduction>,
 }
 
 #[derive(Clone, Debug)]

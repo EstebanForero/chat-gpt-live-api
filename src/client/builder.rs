@@ -47,6 +47,11 @@ impl<S: Clone + Send + Sync + 'static> AiClientBuilder<S> {
         }
     }
 
+    pub fn input_audio_noise_reduction(mut self, config: InputAudioNoiseReduction) -> Self {
+        self.backend_config.input_audio_noise_reduction = Some(config);
+        self
+    }
+
     // ... (All .generation_config(), .voice(), .add_tool_internal(), etc. methods unchanged) ...
     pub fn generation_config(mut self, config: GenerationConfig) -> Self {
         self.backend_config.generation_config = Some(config);
@@ -60,6 +65,7 @@ impl<S: Clone + Send + Sync + 'static> AiClientBuilder<S> {
         self.backend_config.realtime_input_config = Some(config);
         self
     }
+
     pub fn output_audio_transcription(mut self, config: AudioTranscriptionConfig) -> Self {
         self.backend_config.output_audio_transcription = Some(config);
         self
