@@ -1,8 +1,8 @@
+use super::backend::{AppState, BackendConfig, LiveApiBackend, UnifiedServerEvent, WsSink};
 use super::handlers::{Handlers, ServerContentContext, UsageMetadataContext};
 use crate::error::GeminiError;
-use crate::types::*;
+use crate::types::*; // Keep types needed for context structs
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
 use std::sync::Arc;
 use tokio::{
     net::TcpStream,
@@ -11,291 +11,299 @@ use tokio::{
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message,
 };
-use tracing::{Instrument, Span, debug, error, info, trace, warn};
-use url::Url;
+use tracing::{Instrument, Span, debug, error, info, trace, warn}; // Added Instrument, Span
 
-const GEMINI_WS_ENDPOINT: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
-type WsSink = futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
-
-pub(crate) fn spawn_processing_task<S: Clone + Send + Sync + 'static>(
+// Signature updated to use trait objects and BackendConfig
+pub(crate) fn spawn_processing_task(
     api_key: String,
-    initial_setup: BidiGenerateContentSetup,
-    handlers: Arc<Handlers<S>>,
-    state: Arc<S>,
+    backend: Arc<dyn LiveApiBackend>,
+    backend_config: BackendConfig,
+    handlers: Arc<Handlers<dyn AppState + Send + Sync>>,
+    state: Arc<dyn AppState + Send + Sync>,
     shutdown_rx: oneshot::Receiver<()>,
-    outgoing_receiver: mpsc::Receiver<ClientMessagePayload>,
+    outgoing_receiver: mpsc::Receiver<String>, // Receives raw JSON strings
 ) {
-    tokio::spawn(async move {
-        info!("Processing task starting...");
-        match connect_and_listen(
-            api_key,
-            initial_setup,
-            handlers,
-            state,
-            shutdown_rx,
-            outgoing_receiver,
-        )
-        .await
-        {
-            Ok(_) => info!("Processing task finished gracefully."),
-            Err(e) => error!("Processing task failed: {:?}", e),
+    let task_span = info_span!("connection_task", provider = ?backend.provider_type(), model = %backend_config.model);
+    tokio::spawn(
+        async move {
+            info!("Processing task starting...");
+            match connect_and_listen(
+                api_key,
+                backend,
+                backend_config,
+                handlers,
+                state,
+                shutdown_rx,
+                outgoing_receiver,
+            )
+            .await
+            {
+                Ok(_) => info!("Processing task finished gracefully."),
+                Err(e) => error!("Processing task failed: {:?}", e),
+            }
         }
-    });
+        .instrument(task_span), // Apply span to the entire task
+    );
 }
 
-async fn connect_and_listen<S: Clone + Send + Sync + 'static>(
+// Signature updated
+async fn connect_and_listen(
     api_key: String,
-    initial_setup: BidiGenerateContentSetup,
-    handlers: Arc<Handlers<S>>,
-    state: Arc<S>,
+    backend: Arc<dyn LiveApiBackend>,
+    backend_config: BackendConfig,
+    handlers: Arc<Handlers<dyn AppState + Send + Sync>>,
+    state: Arc<dyn AppState + Send + Sync>,
     mut shutdown_rx: oneshot::Receiver<()>,
-    mut outgoing_rx: mpsc::Receiver<ClientMessagePayload>,
+    mut outgoing_rx: mpsc::Receiver<String>,
 ) -> Result<(), GeminiError> {
-    let url_with_key_str = format!("{}?key={}", GEMINI_WS_ENDPOINT, &api_key);
-    Url::parse(&url_with_key_str)
-        .map_err(|e| GeminiError::ApiError(format!("Invalid URL: {}", e)))?;
-    info!("Connecting to WebSocket: {}", url_with_key_str);
+    let url = backend.get_websocket_url(&api_key)?;
+    info!("Attempting to connect to WebSocket: {}", url);
 
-    let connect_result = connect_async(&url_with_key_str).await;
-    let (ws_stream, _) = connect_result.map_err(|e| {
-        error!("WebSocket connection failed: {}", e);
-        GeminiError::WebSocketError(e)
-    })?;
-    info!("WebSocket handshake successful.");
+    // Build request using backend trait
+    let base_request = http::Request::builder()
+        .method("GET")
+        .uri(url.as_str())
+        .body(())
+        .map_err(|e| {
+            GeminiError::ConfigurationError(format!("Failed to build base request: {}", e))
+        })?;
+
+    let configured_request =
+        backend.configure_websocket_request(&api_key, base_request, &backend_config)?;
+    trace!("Configured WebSocket request: {:?}", configured_request);
+
+    let (ws_stream, response) = match connect_async(configured_request).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("WebSocket connection failed: {}", e);
+            // Provide more context if possible (e.g., response status if available in error)
+            return Err(GeminiError::WebSocketError(e));
+        }
+    };
+    info!(
+        "WebSocket handshake successful. Status: {}",
+        response.status()
+    );
+    if !response.status().is_success() && response.status().as_u16() != 101 {
+        // 101 is Switching Protocols, which is expected for WebSocket
+        error!(
+            "WebSocket handshake returned non-success status: {}",
+            response.status()
+        );
+        // You might want to read the body here for more error details if available
+        return Err(GeminiError::ApiError(format!(
+            "WebSocket handshake failed with status {}",
+            response.status()
+        )));
+    }
 
     let (ws_sink_split, mut ws_stream_split) = ws_stream.split();
     let ws_sink_arc = Arc::new(TokioMutex::new(ws_sink_split));
 
-    let setup_payload = ClientMessagePayload::Setup(initial_setup.clone());
-    let setup_json = serde_json::to_string(&setup_payload)?;
-    ws_sink_arc
-        .lock()
-        .await
-        .send(Message::Text(setup_json.into()))
-        .await?;
-    debug!("Sent initial setup message.");
-
-    match serde_json::to_string_pretty(&initial_setup) {
-        Ok(setup_str_pretty) => {
-            info!(
-                "Attempting to send initial setup message (BidiGenerateContentSetup):\n{}",
-                setup_str_pretty
-            );
+    // Send initial messages from backend
+    let initial_messages = backend.get_initial_messages(&backend_config).await?;
+    if !initial_messages.is_empty() {
+        debug!("Sending {} initial message(s)...", initial_messages.len());
+        let mut sink_guard = ws_sink_arc.lock().await;
+        for msg in initial_messages {
+            trace!("Sending initial message content: {}", msg);
+            if let Err(e) = sink_guard.send(Message::Text(msg)).await {
+                error!("Failed to send initial message: {}", e);
+                return Err(GeminiError::WebSocketError(e)); // Consider this fatal
+            }
         }
-        Err(e) => {
-            warn!(
-                "Could not serialize initial_setup for pretty logging: {}. Sending raw debug.",
-                e
-            );
-            info!(
-                "Attempting to send initial setup message (BidiGenerateContentSetup) (debug):\n{:?}",
-                initial_setup
-            );
-        }
-    }
-
-    debug!("Waiting for SetupComplete message...");
-    let setup_complete_message = match ws_stream_split.next().await {
-        Some(Ok(msg)) => msg,
-        Some(Err(e)) => return Err(GeminiError::WebSocketError(e)),
-        None => return Err(GeminiError::ConnectionClosed),
-    };
-
-    let setup_ok = match setup_complete_message.clone() {
-        Message::Text(t) => serde_json::from_str::<ServerMessage>(&t)
-            .ok()
-            .is_some_and(|m| m.setup_complete.is_some()),
-        Message::Binary(b) => String::from_utf8(b.into())
-            .ok()
-            .and_then(|t| serde_json::from_str::<ServerMessage>(&t).ok())
-            .is_some_and(|m| m.setup_complete.is_some()),
-        _ => false,
-    };
-
-    if setup_ok {
-        info!("SetupComplete received and parsed.");
+        drop(sink_guard); // Release lock
+        debug!("Initial message(s) sent.");
     } else {
-        error!(
-            "SetupComplete message not successfully received or parsed. First message: {:?}",
-            setup_complete_message
-        );
-        return Err(GeminiError::UnexpectedMessage);
+        debug!("No initial messages to send.");
     }
-    info!("Setup phase complete. Entering main listen loop...");
 
+    // Store output format for audio decoding
+    let output_audio_format = backend_config.output_audio_format.clone();
+
+    // Main loop
+    info!("Entering main processing loop...");
     loop {
         tokio::select! {
-            biased;
+            biased; // Check shutdown first
             _ = &mut shutdown_rx => {
-                info!("Shutdown signal received. Closing WebSocket.");
+                info!("Shutdown signal received. Closing WebSocket connection.");
                 let mut sink_guard = ws_sink_arc.lock().await;
+                // Attempt graceful close
                 let _ = sink_guard.send(Message::Close(None)).await;
                 let _ = sink_guard.close().await;
+                 drop(sink_guard);
+                info!("WebSocket closed due to shutdown signal.");
                 return Ok(());
             }
             maybe_outgoing = outgoing_rx.recv() => {
-                if let Some(payload) = maybe_outgoing {
-                     trace!("Sending outgoing message: {:?}", payload);
-                     let json_message = match serde_json::to_string(&payload) {
-                        Ok(json) => json,
-                        Err(e) => {
-                            error!("Failed to serialize outgoing message: {}", e);
-                            continue;
-                        }
-                     };
+                if let Some(json_message) = maybe_outgoing {
+                     trace!("Sending outgoing message ({} bytes)", json_message.len());
                      let mut sink_guard = ws_sink_arc.lock().await;
-                     if let Err(e) = sink_guard.send(Message::Text(json_message.into())).await {
+                     if let Err(e) = sink_guard.send(Message::Text(json_message)).await {
                           error!("Failed to send outgoing message via WebSocket: {}", e);
+                          // Optional: Check if error is fatal (e.g., connection closed)
+                           if matches!(e, tokio_tungstenite::tungstenite::Error::ConnectionClosed |
+                                         tokio_tungstenite::tungstenite::Error::AlreadyClosed) {
+                                error!("Connection closed, cannot send message. Exiting task.");
+                                drop(sink_guard);
+                                return Err(GeminiError::ConnectionClosed); // Fatal
+                           }
+                           // Otherwise, log and continue? Or return error? Depends on desired robustness.
                      }
+                      drop(sink_guard); // Release lock
                 } else {
-                    info!("Outgoing message channel closed. Listener will exit when WebSocket closes.");
+                    info!("Outgoing message channel closed. Listener will stop accepting new messages.");
+                    // Don't exit immediately, wait for WebSocket to close or shutdown signal
                 }
             }
             msg_result = ws_stream_split.next() => {
                 match msg_result {
                     Some(Ok(message)) => {
-                        let current_span = Span::current();
-                        let should_stop = process_server_message(
-                            message,
-                            &handlers,
-                            &state,
-                            &ws_sink_arc,
-                        ).instrument(current_span).await?;
-                        if should_stop {
-                            info!("process_server_message indicated stop (e.g., Close frame).");
-                            break;
+                         trace!("Received WebSocket message: {:?}", message);
+                        let current_span = Span::current(); // Get span for instrumentation
+
+                        // Use backend to parse message into UnifiedServerEvents
+                         match backend.parse_server_message(
+                             message,
+                             &handlers,
+                             &state,
+                             &ws_sink_arc,
+                             &output_audio_format // Pass format for decoding
+                         ).instrument(current_span).await { // Instrument the parsing logic
+                            Ok(unified_events) => {
+                                if unified_events.is_empty() { continue; } // Skip if no events (e.g., ping/pong)
+
+                                let mut should_stop = false;
+                                for event in unified_events {
+                                     trace!("Processing unified event: {:?}", event);
+                                    if handle_unified_event(event, &handlers, &state).await {
+                                        should_stop = true;
+                                         break; // Stop processing events if Close received
+                                    }
+                                }
+                                if should_stop {
+                                     info!("Stop signal received from event handler (Close event). Exiting loop.");
+                                     break; // Exit select loop
+                                 }
+                            }
+                            Err(e) => {
+                                error!("Error processing server message: {:?}", e);
+                                // Decide if this is fatal. Maybe specific errors?
+                                // For now, log and continue. Could return Err(e) to stop the task.
+                            }
                         }
                     }
                     Some(Err(e)) => {
                          error!("WebSocket read error: {:?}", e);
+                         // Treat read errors as fatal for now
                          return Err(GeminiError::WebSocketError(e));
                     }
                     None => {
                          info!("WebSocket stream ended (server closed connection).");
-                         return Ok(());
+                         return Ok(()); // Graceful exit
                     }
                 }
             }
         }
-    }
-    info!("Listen loop exited. Closing sink.");
+    } // End main loop
+
+    info!("Listen loop exited. Cleaning up.");
+    // Ensure sink is closed on loop exit (e.g., break due to should_stop)
     let mut sink_guard = ws_sink_arc.lock().await;
     let _ = sink_guard.close().await;
+    drop(sink_guard);
     Ok(())
 }
 
-async fn process_server_message<S: Clone + Send + Sync + 'static>(
-    message: Message,
-    handlers: &Arc<Handlers<S>>,
-    state: &Arc<S>,
-    ws_sink_arc: &Arc<TokioMutex<WsSink>>,
-) -> Result<bool, GeminiError> {
-    let server_msg_text: Option<String> = match message {
-        Message::Text(t) => Some(t.to_string()),
-        Message::Binary(b) => String::from_utf8(b.into()).ok(),
-        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(false),
-        Message::Close(close_frame_opt) => {
-            if let Some(close_frame) = close_frame_opt {
-                error!(
-                    "Received WebSocket Close frame from server. Code: {:?}, Reason: '{}'",
-                    close_frame.code,
-                    close_frame.reason.to_string(),
-                );
-            } else {
-                info!("Received WebSocket Close frame from server (no specific code/reason).");
-            }
-            return Ok(true);
+// Helper function to handle dispatching unified events to handlers
+async fn handle_unified_event(
+    event: UnifiedServerEvent,
+    handlers: &Arc<Handlers<dyn AppState + Send + Sync>>,
+    state: &Arc<dyn AppState + Send + Sync>,
+) -> bool {
+    // Returns true if processing should stop (Close event)
+    match event {
+        UnifiedServerEvent::SetupComplete => {
+            info!("Connection setup complete.");
+            // Optional: Call an on_setup_complete handler
         }
-    };
-
-    if let Some(text_string) = server_msg_text {
-        match serde_json::from_str::<ServerMessage>(&text_string) {
-            Ok(server_message) => {
-                let mut is_turn_complete = false;
-
-                if let Some(content_data) = server_message.server_content {
-                    if content_data.turn_complete {
-                        is_turn_complete = true;
-                    }
-                    if let Some(handler) = &handlers.on_server_content {
-                        let ctx = ServerContentContext {
-                            content: content_data,
-                        };
-                        // Pass the state Arc<S>
-                        handler.call(ctx, state.clone()).await;
-                    }
+        UnifiedServerEvent::ContentUpdate { text, audio, done } => {
+            if let Some(handler) = &handlers.on_server_content {
+                // Adapt ServerContentContext
+                let ctx = ServerContentContext {
+                    text,
+                    audio,
+                    is_done: done,
+                };
+                handler.call(ctx, state.clone()).await;
+            } else {
+                // Default logging if no handler
+                if let Some(t) = text {
+                    info!("[Content Text]: {}", t);
                 }
-
-                if let Some(tool_call_data) = server_message.tool_call {
-                    let mut responses_to_send = Vec::new();
-                    for func_call in tool_call_data.function_calls {
-                        if let Some(handler) = handlers.tool_handlers.get(&func_call.name) {
-                            let call_id = func_call.id.clone();
-                            let call_name = func_call.name.clone();
-                            let handler_clone = handler.clone();
-                            let state_clone_for_tool = state.clone();
-
-                            let tool_result = handler_clone
-                                .call(func_call.args, state_clone_for_tool)
-                                .await;
-
-                            let response_for_tool = match tool_result {
-                                Ok(response_data) => FunctionResponse {
-                                    id: call_id,
-                                    name: call_name,
-                                    response: response_data,
-                                },
-                                Err(e) => FunctionResponse {
-                                    id: call_id,
-                                    name: call_name,
-                                    response: json!({"error": e}),
-                                },
-                            };
-                            responses_to_send.push(response_for_tool);
-                        } else {
-                            warn!("No handler registered for tool: {}", func_call.name);
-                            responses_to_send.push(FunctionResponse {
-                                id: func_call.id,
-                                name: func_call.name,
-                                response: json!({"error": "Function not implemented by client."}),
-                            });
-                        }
-                    }
-                    let len_resp;
-                    if !responses_to_send.is_empty() {
-                        len_resp = responses_to_send.len();
-                        let tool_resp_msg =
-                            ClientMessagePayload::ToolResponse(BidiGenerateContentToolResponse {
-                                function_responses: responses_to_send,
-                            });
-                        let json_msg = serde_json::to_string(&tool_resp_msg)?;
-                        let mut sink_guard = ws_sink_arc.lock().await;
-                        if let Err(e) = sink_guard.send(Message::Text(json_msg.into())).await {
-                            error!("Failed to send tool response(s): {}", e);
-                            return Err(GeminiError::WebSocketError(e));
-                        }
-                        info!("Sent {} tool response(s).", len_resp);
-                    }
+                if let Some(a) = audio {
+                    info!("[Content Audio]: {} samples", a.len());
                 }
-
-                if let Some(metadata) = server_message.usage_metadata {
-                    if let Some(handler) = &handlers.on_usage_metadata {
-                        let ctx = UsageMetadataContext { metadata };
-                        handler.call(ctx, state.clone()).await;
-                    }
+                if done {
+                    trace!("[Content Part Done]");
                 }
-
-                return Ok(false);
             }
-            Err(e) => {
-                error!(
-                    "Failed to parse ServerMessage: {:?}, raw text size: {}",
-                    e,
-                    text_string.len()
-                );
-                trace!("Failed parse raw text: '{}'", text_string);
+        }
+        UnifiedServerEvent::TranscriptionUpdate { text, done } => {
+            // Call a new on_transcription handler?
+            // Example:
+            // if let Some(handler) = &handlers.on_transcription {
+            //     let ctx = TranscriptionContext { text, is_final: done };
+            //     handler.call(ctx, state.clone()).await;
+            // } else {
+            info!(
+                "[Transcription]: {}{}",
+                text,
+                if done { " (Final)" } else { "" }
+            );
+            // }
+        }
+        UnifiedServerEvent::ToolCall { id, name, args } => {
+            // Tool calls are now initiated by the backend's parse_server_message,
+            // which calls the handler directly. This event is more for notification.
+            info!(
+                "[Tool Call Requested] Name: '{}', ID: {:?}, Args: {:?}",
+                name, id, args
+            );
+            // Optional: Call an on_tool_request handler if user needs to intercept/log
+        }
+        UnifiedServerEvent::ModelTurnComplete => {
+            info!("Model turn complete.");
+            // Optional: Call an on_turn_complete handler
+        }
+        UnifiedServerEvent::ModelGenerationComplete => {
+            info!("Model generation complete.");
+            // Optional: Call an on_generation_complete handler
+        }
+        UnifiedServerEvent::UsageMetadata(metadata) => {
+            if let Some(handler) = &handlers.on_usage_metadata {
+                let ctx = UsageMetadataContext { metadata };
+                handler.call(ctx, state.clone()).await;
+            } else {
+                info!("[Usage Metadata]: {:?}", metadata);
             }
+        }
+        UnifiedServerEvent::Error(api_error) => {
+            error!(
+                "API Error Received: Code='{}', Msg='{}', ClientEventID={:?}",
+                api_error.code, api_error.message, api_error.event_id
+            );
+            // Optional: Call an on_error handler
+        }
+        UnifiedServerEvent::ProviderSpecific(value) => {
+            debug!("Received provider specific event: {:?}", value);
+            // Optional: Call an on_provider_event handler
+        }
+        UnifiedServerEvent::Close => {
+            info!("Server initiated connection close.");
+            return true; // Signal to stop processing
         }
     }
-    Ok(false)
+    false // Continue processing
 }

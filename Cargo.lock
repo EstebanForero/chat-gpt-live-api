@@ -506,6 +506,7 @@ dependencies = [
  "dotenv",
  "futures-util",
  "gemini-live-macros",
+ "http",
  "rustls",
  "serde",
  "serde_json",
