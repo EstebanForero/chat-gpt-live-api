@@ -371,7 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder = builder.output_audio_format("pcm16".to_string());
 
     builder = builder.output_audio_transcription(AudioTranscriptionConfig {
-        model: None,
+        model: Some("whisper-1".to_string()),
         language: Some("en".to_string()),
         prompt: None
     });
