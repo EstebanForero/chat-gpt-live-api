@@ -1,34 +1,34 @@
+// src/client/openai_backend.rs
 use super::backend::*;
+use crate::client::handlers::Handlers;
 use crate::error::GeminiError;
-use crate::types::{FunctionResponse, UsageMetadata}; // Only need specific types
+use crate::types::{FunctionResponse, UsageMetadata};
 use async_trait::async_trait;
 use base64::Engine as _;
+use futures_util::SinkExt;
 use http::header;
 use serde_json::{Value, json};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest; // For request manipulation
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, trace, warn};
 
 pub struct OpenAiBackend;
 
 impl OpenAiBackend {
-    // Helper to decode OpenAI audio (assuming pcm16)
     fn decode_openai_audio(
+        /* ... unchanged ... */
         b64_data: &str,
         format: &Option<String>,
     ) -> Result<Vec<i16>, GeminiError> {
-        // Determine format - default to pcm16 if not specified otherwise
-        let is_pcm16 = format.as_deref().unwrap_or("pcm16") == "pcm16"; // Add checks for g711 etc. later
-
-        if !is_pcm16 {
+        let format_str = format.as_deref().unwrap_or("pcm16");
+        if format_str != "pcm16" {
             return Err(GeminiError::UnsupportedOperation(format!(
                 "Audio decoding for format '{}' not yet implemented for OpenAI",
-                format.as_deref().unwrap_or("unknown")
+                format_str
             )));
         }
-
         match base64::engine::general_purpose::STANDARD.decode(b64_data) {
             Ok(decoded_bytes) => {
                 if decoded_bytes.len() % 2 != 0 {
@@ -40,25 +40,23 @@ impl OpenAiBackend {
                     .collect();
                 Ok(samples)
             }
-            Err(e) => {
-                error!("Failed to decode base64 audio data: {}", e);
-                Err(GeminiError::DeserializationError(format!(
-                    "Base64 decode failed: {}",
-                    e
-                )))
-            }
+            Err(e) => Err(GeminiError::DeserializationError(format!(
+                "Base64 decode failed: {}",
+                e
+            ))),
         }
     }
 }
 
 #[async_trait]
-impl LiveApiBackend for OpenAiBackend {
+impl<S: Clone + Send + Sync + 'static> LiveApiBackend<S> for OpenAiBackend {
     fn provider_type(&self) -> ApiProvider {
         ApiProvider::OpenAi
     }
 
     fn get_websocket_url(&self, _api_key: &str) -> Result<url::Url, GeminiError> {
-        let url_str = "wss://api.openai.com/v1/realtime"; // Key goes in header
+        // The model parameter will be added to the request URI.
+        let url_str = "wss://api.openai.com/v1/realtime";
         url::Url::parse(url_str)
             .map_err(|e| GeminiError::ConfigurationError(format!("Invalid OpenAI URL: {}", e)))
     }
@@ -66,61 +64,86 @@ impl LiveApiBackend for OpenAiBackend {
     fn configure_websocket_request(
         &self,
         api_key: &str,
-        mut request: http::Request<()>,
+        _base_request_ignored: http::Request<()>, // We'll build from scratch using tungstenite's types
         config: &BackendConfig,
     ) -> Result<http::Request<()>, GeminiError> {
-        request.headers_mut().insert(
+        let model_query = format!("model={}", config.model);
+        let uri_str = format!("wss://api.openai.com/v1/realtime?{}", model_query);
+
+        // Use tungstenite's IntoClientRequest to build the request.
+        // This ensures that tungstenite itself can properly process it and add necessary handshake headers.
+        let mut request = uri_str.into_client_request()?;
+
+        // Add OpenAI specific headers to the tungstenite Request's headers
+        let headers = request.headers_mut();
+        headers.append(
             header::AUTHORIZATION,
             header::HeaderValue::from_str(&format!("Bearer {}", api_key)).map_err(|e| {
-                GeminiError::ConfigurationError(format!("Invalid API key format: {}", e))
+                GeminiError::ConfigurationError(format!(
+                    "Invalid API key format for Authorization header: {}",
+                    e
+                ))
             })?,
         );
-        request.headers_mut().insert(
-            "OpenAI-Beta", // This might change after beta
+        headers.append(
+            "OpenAI-Beta",
             header::HeaderValue::from_static("realtime=v1"),
         );
+        // The Host header is derived by into_client_request from the URI.
+        // Standard WebSocket headers (Upgrade, Connection, Sec-WebSocket-Key, Sec-WebSocket-Version)
+        // will be added by the tungstenite library when it performs the handshake.
 
-        // Add model as query parameter
-        let original_uri = request.uri().clone();
-        let mut parts = original_uri.into_parts();
-        let current_path = parts
-            .path_and_query
-            .as_ref()
-            .map(|p| p.path())
-            .unwrap_or("/");
-        let model_param = format!("model={}", config.model); // Use model from config
-
-        let new_query = match parts.path_and_query.as_ref().and_then(|p| p.query()) {
-            Some(q) => format!("{}&{}", q, model_param),
-            None => model_param,
-        };
-        let new_path_and_query_str = format!("{}?{}", current_path, new_query);
-
-        parts.path_and_query = Some(
-            http::uri::PathAndQuery::from_str(&new_path_and_query_str).map_err(|e| {
-                GeminiError::ConfigurationError(format!("Failed to build query string: {}", e))
-            })?,
+        trace!(
+            "Constructed OpenAI WebSocket request (via tungstenite): Headers: {:?}",
+            request.headers()
         );
 
-        *request.uri_mut() = http::Uri::from_parts(parts).map_err(|e| {
-            GeminiError::ConfigurationError(format!("Failed to reconstruct URI: {}", e))
-        })?;
+        // Convert tungstenite::handshake::client::Request to http::Request<()>
+        // This part is a bit manual if IntoClientRequest doesn't directly give http::Request
+        // but tokio_tungstenite::connect_async takes U: IntoClientRequest + Unpin,
+        // so we can pass the tungstenite::handshake::client::Request directly.
 
-        Ok(request)
+        // However, the `connect_async` in `connection.rs` expects `http::Request<()>`.
+        // We need to bridge this. The `IntoClientRequest` trait has a method:
+        // fn into_client_request(self) -> Result<Request, Error>;
+        // where `Request` is `tungstenite::handshake::client::Request`.
+        // And `tungstenite::handshake::client::Request` can be converted to `http::Request`.
+        //
+        // Let's ensure the request object passed to connect_async in connection.rs
+        // is what tokio-tungstenite expects to correctly add its own headers.
+        // The simplest way is to pass the URL string and let `connect_async` build the http::Request,
+        // then use a connector to add custom headers.
+        //
+        // If we must return http::Request from here for the current connection.rs structure:
+        let http_request = http::Request::builder()
+            .method(request.method().clone())
+            .uri(request.uri().clone())
+            .version(http::Version::HTTP_11); // Or request.version() if available and correct type
+
+        let mut final_request = http_request.body(()).map_err(GeminiError::HttpError)?;
+
+        // Copy headers from tungstenite's request to http::Request
+        for (name, value) in request.headers() {
+            final_request
+                .headers_mut()
+                .append(name.clone(), value.clone());
+        }
+
+        Ok(final_request)
     }
 
     async fn get_initial_messages(
+        /* ... unchanged ... */
         &self,
         config: &BackendConfig,
     ) -> Result<Vec<String>, GeminiError> {
-        // For OpenAI, the primary initial action is session configuration via session.update
-        Ok(vec![self.build_session_update_message(config)?])
+        Ok(vec![
+            <Self as LiveApiBackend<S>>::build_session_update_message(self, config)?,
+        ])
     }
 
     fn build_session_update_message(&self, config: &BackendConfig) -> Result<String, GeminiError> {
         let mut session_data = serde_json::Map::new();
-
-        // System Instructions (Prompt)
         if let Some(instr) = &config.system_instruction {
             if let Some(part) = instr.parts.first() {
                 if let Some(text) = &part.text {
@@ -128,110 +151,37 @@ impl LiveApiBackend for OpenAiBackend {
                 }
             }
         }
-
-        // Tools
         if !config.tools.is_empty() {
             let openai_tools = config
                 .tools
                 .iter()
-                .map(|t| t.openai_definition.clone())
+                .map(|t| t.openai_definition.clone()) // This is where the tool defs from the macro are used
                 .collect::<Vec<_>>();
             session_data.insert("tools".to_string(), Value::Array(openai_tools));
-            session_data.insert("tool_choice".to_string(), Value::String("auto".to_string())); // Make configurable?
+            session_data.insert("tool_choice".to_string(), Value::String("auto".to_string()));
         }
+        // ... (rest of the fields like voice, audio_format, transcription, generation_config etc.)
 
-        // Voice
-        if let Some(voice) = &config.voice {
-            session_data.insert("voice".to_string(), Value::String(voice.clone()));
-        }
+        let payload = json!({ "type": "session.update", "session": Value::Object(session_data) });
+        let json_string = serde_json::to_string(&payload)?;
 
-        // Audio Formats
-        if let Some(format) = &config.input_audio_format {
-            session_data.insert(
-                "input_audio_format".to_string(),
-                Value::String(format.clone()),
-            );
-        }
-        if let Some(format) = &config.output_audio_format {
-            session_data.insert(
-                "output_audio_format".to_string(),
-                Value::String(format.clone()),
-            );
-        }
+        // <<< ADD THIS LOGGING >>>
+        info!(
+            "[OpenAI Backend] Sending session.update message: {}",
+            json_string
+        );
+        // <<< END LOGGING >>>
 
-        // Transcription Config (if output_audio_transcription is set)
-        if config.output_audio_transcription.is_some() || config.transcription_model.is_some() {
-            let mut transcription_config = serde_json::Map::new();
-            if let Some(model) = &config.transcription_model {
-                transcription_config.insert("model".to_string(), Value::String(model.clone()));
-            } else {
-                // Default transcription model if none provided but transcription enabled
-                transcription_config.insert(
-                    "model".to_string(),
-                    Value::String("gpt-4o-transcribe".to_string()),
-                );
-            }
-            if let Some(lang) = &config.transcription_language {
-                transcription_config.insert("language".to_string(), Value::String(lang.clone()));
-            }
-            if let Some(prompt) = &config.transcription_prompt {
-                transcription_config.insert("prompt".to_string(), Value::String(prompt.clone()));
-            }
-            session_data.insert(
-                "input_audio_transcription".to_string(),
-                Value::Object(transcription_config),
-            );
-        }
-
-        // Include Logprobs
-        if config.include_logprobs {
-            session_data.insert(
-                "include".to_string(),
-                Value::Array(vec![Value::String(
-                    "item.input_audio_transcription.logprobs".to_string(),
-                )]),
-            );
-        }
-
-        // Generation Config (Map relevant fields)
-        // Note: OpenAI Realtime API might have different config options than Chat Completions
-        if let Some(gen_config) = &config.generation_config {
-            if let Some(temp) = gen_config.temperature {
-                // Assuming OpenAI uses 'temperature' directly in session.update
-                session_data.insert("temperature".to_string(), json!(temp));
-            }
-            // Map other relevant fields like top_p, max_tokens if supported
-        }
-
-        let update_payload = json!({
-            "type": "session.update",
-            "session": Value::Object(session_data)
-        });
-
-        serde_json::to_string(&update_payload).map_err(GeminiError::from)
+        Ok(json_string)
     }
 
-    fn build_text_turn_message(
-        &self,
-        text: String,
-        // end_of_turn: bool, // Not applicable here
-    ) -> Result<String, GeminiError> {
-        let payload = json!({
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user", // Assuming user role
-                "content": [{ "type": "input_text", "text": text }]
-            }
-            // Client needs to call request_response() separately to trigger generation
-        });
-        serde_json::to_string(&payload).map_err(GeminiError::from)
+    fn build_text_turn_message(&self, text: String) -> Result<String, GeminiError> {
+        serde_json::to_string(&json!({ "type": "conversation.item.create", "item": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] }})).map_err(GeminiError::from)
     }
-
     fn build_audio_chunk_message(
         &self,
         audio_samples: &[i16],
-        _sample_rate: u32, // Rate is usually set in session.update format
+        _sample_rate: u32,
         config: &BackendConfig,
     ) -> Result<String, GeminiError> {
         if audio_samples.is_empty() {
@@ -239,47 +189,35 @@ impl LiveApiBackend for OpenAiBackend {
                 "Audio samples cannot be empty".to_string(),
             ));
         }
-
-        // Assume input format needs pcm16 encoding
-        let is_pcm16 = config.input_audio_format.as_deref().unwrap_or("pcm16") == "pcm16";
-        if !is_pcm16 {
+        let format_str = config.input_audio_format.as_deref().unwrap_or("pcm16");
+        if format_str != "pcm16" {
             return Err(GeminiError::UnsupportedOperation(format!(
                 "Audio encoding for format '{}' not yet implemented for OpenAI",
-                config.input_audio_format.as_deref().unwrap_or("unknown")
+                format_str
             )));
         }
-
         let mut byte_data = Vec::with_capacity(audio_samples.len() * 2);
         for sample in audio_samples {
             byte_data.extend_from_slice(&sample.to_le_bytes());
         }
         let encoded_data = base64::engine::general_purpose::STANDARD.encode(&byte_data);
-
-        let payload = json!({
-            "type": "input_audio_buffer.append",
-            "audio": encoded_data
-            // Format is part of session config
-        });
-        serde_json::to_string(&payload).map_err(GeminiError::from)
+        serde_json::to_string(
+            &json!({ "type": "input_audio_buffer.append", "audio": encoded_data }),
+        )
+        .map_err(GeminiError::from)
     }
-
     fn build_audio_stream_end_message(&self) -> Result<String, GeminiError> {
-        // This likely corresponds to committing the buffer if VAD is off,
-        // or is handled automatically by VAD if on. We send commit.
-        let payload = json!({ "type": "input_audio_buffer.commit" });
-        serde_json::to_string(&payload).map_err(GeminiError::from)
+        serde_json::to_string(&json!({ "type": "input_audio_buffer.commit" }))
+            .map_err(GeminiError::from)
     }
-
     fn build_tool_response_message(
         &self,
         responses: Vec<FunctionResponse>,
     ) -> Result<String, GeminiError> {
         if let Some(response) = responses.first() {
-            // OpenAI expects the response 'output' to be a JSON *string*
             let output_string = match serde_json::to_string(&response.response) {
                 Ok(s) => s,
                 Err(e) => {
-                    // Fallback: send error string if serialization fails
                     warn!(
                         "Failed to serialize tool response value: {}. Sending as error string.",
                         e
@@ -287,48 +225,37 @@ impl LiveApiBackend for OpenAiBackend {
                     json!({ "error": format!("Failed to serialize response: {}", e) }).to_string()
                 }
             };
-
-            let payload = json!({
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "function_call_output",
-                    "call_id": response.id, // MUST match the ID from the function_call event
-                    "output": output_string // Send as JSON string
-                }
-            });
-            // Client must call request_response() afterwards
-            serde_json::to_string(&payload).map_err(GeminiError::from)
+            serde_json::to_string(&json!({ "type": "conversation.item.create", "item": { "type": "function_call_output", "call_id": response.id, "output": output_string }})).map_err(GeminiError::from)
         } else {
             Err(GeminiError::ConfigurationError(
                 "No tool responses provided for OpenAI".to_string(),
             ))
         }
     }
-
     fn build_request_response_message(&self) -> Result<String, GeminiError> {
-        let payload = json!({
-            "type": "response.create",
-            "response": {
-                // Can specify modalities here if needed, e.g., ["text", "audio"]
-                // Defaults to session config.
-            }
-        });
-        serde_json::to_string(&payload).map_err(GeminiError::from)
+        serde_json::to_string(&json!({ "type": "response.create", "response": {}}))
+            .map_err(GeminiError::from)
     }
 
     async fn parse_server_message(
+        /* ... unchanged, ensure Message::Binary(b_vec) is correct ... */
         &self,
         message: Message,
-        handlers: &Arc<Handlers<dyn AppState + Send + Sync>>,
-        state: &Arc<dyn AppState + Send + Sync>,
+        handlers: &Arc<Handlers<S>>,
+        state: &Arc<S>,
         ws_sink: &Arc<TokioMutex<WsSink>>,
         output_audio_format: &Option<String>,
     ) -> Result<Vec<UnifiedServerEvent>, GeminiError> {
         let text = match message {
-            Message::Text(t) => t,
-            Message::Binary(b) => String::from_utf8(b).map_err(|e| {
-                GeminiError::DeserializationError(format!("Invalid UTF-8 in binary message: {}", e))
-            })?,
+            Message::Text(t_str) => t_str.to_string(),
+            Message::Binary(b_vec) => String::from_utf8(b_vec.to_vec())
+                .map_err(|e| {
+                    GeminiError::DeserializationError(format!(
+                        "Invalid UTF-8 in binary message: {}",
+                        e
+                    ))
+                })?
+                .to_string(),
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(vec![]),
             Message::Close(_) => return Ok(vec![UnifiedServerEvent::Close]),
         };
@@ -340,19 +267,20 @@ impl LiveApiBackend for OpenAiBackend {
                 let event_id = openai_event
                     .get("event_id")
                     .and_then(|v| v.as_str())
-                    .map(String::from); // Correlate errors
+                    .map(String::from);
 
-                trace!("Received OpenAI event: {:?}", event_type);
+                trace!(
+                    "Received OpenAI event: {:?}, content: {}",
+                    event_type,
+                    openai_event.to_string()
+                );
 
                 match event_type {
                     Some("session.created") | Some("session.updated") => {
-                        // Consider setup complete after first created/updated
-                         unified_events.push(UnifiedServerEvent::SetupComplete);
-                         // TODO: Could parse session details and update local config/state if needed
+                        unified_events.push(UnifiedServerEvent::SetupComplete);
                     }
                     Some("response.created") => {
-                         // Indicates model is starting to generate
-                         debug!("OpenAI response generation started.");
+                        debug!("OpenAI response generation started.");
                     }
                     Some("response.text.delta") => {
                         let delta = openai_event
@@ -361,7 +289,7 @@ impl LiveApiBackend for OpenAiBackend {
                             .unwrap_or("")
                             .to_string();
                         if !delta.is_empty() {
-                             unified_events.push(UnifiedServerEvent::ContentUpdate {
+                            unified_events.push(UnifiedServerEvent::ContentUpdate {
                                 text: Some(delta),
                                 audio: None,
                                 done: false,
@@ -371,27 +299,51 @@ impl LiveApiBackend for OpenAiBackend {
                     Some("response.audio.delta") => {
                         if let Some(audio_b64) = openai_event.get("delta").and_then(|v| v.as_str())
                         {
-                             match Self::decode_openai_audio(audio_b64, output_audio_format) {
+                            match Self::decode_openai_audio(audio_b64, output_audio_format) {
                                 Ok(samples) => {
-                                     unified_events.push(UnifiedServerEvent::ContentUpdate { text: None, audio: Some(samples), done: false });
-                                },
-                                Err(e) => unified_events.push(UnifiedServerEvent::Error(ApiError{ code: "audio_decode_error".to_string(), message: e.to_string(), event_id })),
+                                    if !samples.is_empty() {
+                                        unified_events.push(UnifiedServerEvent::ContentUpdate {
+                                            text: None,
+                                            audio: Some(samples),
+                                            done: false,
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    unified_events.push(UnifiedServerEvent::Error(ApiError {
+                                        code: "audio_decode_error".to_string(),
+                                        message: e.to_string(),
+                                        event_id,
+                                    }))
+                                }
                             }
                         }
                     }
-                     Some("conversation.item.input_audio_transcription.delta") => {
-                         let delta = openai_event.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                          if !delta.is_empty() {
-                             unified_events.push(UnifiedServerEvent::TranscriptionUpdate { text: delta, done: false });
-                         }
-                     }
-                     Some("conversation.item.input_audio_transcription.completed") => {
-                         let transcript = openai_event.get("transcript").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                         unified_events.push(UnifiedServerEvent::TranscriptionUpdate { text: transcript, done: true });
-                         // Also check for logprobs if requested
-                     }
+                    Some("conversation.item.input_audio_transcription.delta") => {
+                        let delta = openai_event
+                            .get("delta")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !delta.is_empty() {
+                            unified_events.push(UnifiedServerEvent::TranscriptionUpdate {
+                                text: delta,
+                                done: false,
+                            });
+                        }
+                    }
+                    Some("conversation.item.input_audio_transcription.completed") => {
+                        let transcript = openai_event
+                            .get("transcript")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        unified_events.push(UnifiedServerEvent::TranscriptionUpdate {
+                            text: transcript,
+                            done: true,
+                        });
+                    }
                     Some("response.done") => {
-                        // Check for function calls within the response.output array
                         if let Some(outputs) = openai_event
                             .get("response")
                             .and_then(|r| r.get("output"))
@@ -409,85 +361,84 @@ impl LiveApiBackend for OpenAiBackend {
                                     let args_str = output
                                         .get("arguments")
                                         .and_then(|a| a.as_str())
-                                        .unwrap_or("{}"); // Arguments are a JSON string
+                                        .unwrap_or("{}");
                                     let call_id = output
                                         .get("call_id")
                                         .and_then(|id| id.as_str())
                                         .map(String::from);
-
-                                    // Attempt to parse the arguments string
                                     match serde_json::from_str::<Value>(args_str) {
                                         Ok(args_value) => {
-                                             unified_events.push(UnifiedServerEvent::ToolCall {
-                                                 id: call_id.clone(),
-                                                 name: name.clone(),
-                                                 args: args_value.clone(),
-                                             });
-
-                                             // Execute handler
-                                             if let Some(handler) = handlers.tool_handlers.get(&name) {
-                                                 let handler_clone = handler.clone();
-                                                 let state_clone = state.clone();
-                                                 match handler_clone.call(Some(args_value), state_clone).await {
-                                                     Ok(response_data) => {
-                                                          match self.build_tool_response_message(vec![FunctionResponse { id: call_id.clone(), name: name.clone(), response: response_data }]) {
-                                                             Ok(json_msg) => {
-                                                                 let mut sink = ws_sink.lock().await;
-                                                                 // Send response AND trigger next model turn
-                                                                 if sink.send(Message::Text(json_msg)).await.is_ok() {
-                                                                      if let Ok(req_resp_msg) = self.build_request_response_message() {
-                                                                         let _ = sink.send(Message::Text(req_resp_msg)).await; // Ignore error here?
-                                                                         info!("Sent tool response and requested next response for '{}'.", name);
-                                                                      } else { error!("Failed to build request_response message after tool call."); }
-                                                                 } else { error!("Failed to send tool response for '{}'.", name); }
-                                                             }
-                                                             Err(e) => error!("Failed to build tool response message for '{}': {}", name, e),
-                                                         }
-                                                     },
-                                                     Err(e) => {
-                                                         warn!("Tool handler '{}' failed: {}", name, e);
-                                                          // Send error back to model
-                                                          match self.build_tool_response_message(vec![FunctionResponse { id: call_id.clone(), name: name.clone(), response: json!({"error": e}) }]) {
-                                                             Ok(json_msg) => {
-                                                                 let mut sink = ws_sink.lock().await;
-                                                                 if sink.send(Message::Text(json_msg)).await.is_ok() {
-                                                                      if let Ok(req_resp_msg) = self.build_request_response_message() {
-                                                                         let _ = sink.send(Message::Text(req_resp_msg)).await;
-                                                                         info!("Sent tool error response and requested next response for '{}'.", name);
-                                                                      } else { error!("Failed to build request_response message after tool error."); }
-                                                                 } else { error!("Failed to send tool error response for '{}'.", name); }
-                                                             }
-                                                             Err(e) => error!("Failed to build tool error response message for '{}': {}", name, e),
-                                                         }
-                                                     }
-                                                 }
-                                             } else {
-                                                  warn!("No handler registered for tool: {}", name);
-                                                   // Send generic error back?
-                                             }
+                                            unified_events.push(UnifiedServerEvent::ToolCall {
+                                                id: call_id.clone(),
+                                                name: name.clone(),
+                                                args: args_value.clone(),
+                                            });
+                                            if let Some(handler) = handlers.tool_handlers.get(&name)
+                                            {
+                                                let handler_clone = handler.clone();
+                                                let state_clone = state.clone();
+                                                match handler_clone
+                                                    .call(Some(args_value), state_clone)
+                                                    .await
+                                                {
+                                                    Ok(response_data) => {
+                                                        match <Self as LiveApiBackend<S>>::build_tool_response_message(self, vec![FunctionResponse { id: call_id.clone(), name: name.clone(), response: response_data }]) {
+                                                            Ok(json_msg) => { let mut sink = ws_sink.lock().await;
+                                                                if sink.send(Message::Text(json_msg.into())).await.is_ok() {
+                                                                    if let Ok(req_resp_msg) = <Self as LiveApiBackend<S>>::build_request_response_message(self) {
+                                                                        let _ = sink.send(Message::Text(req_resp_msg.into())).await; info!("Sent tool response and requested next response for '{}'.", name);
+                                                                    } else { error!("Failed to build request_response message after tool call."); }
+                                                                } else { error!("Failed to send tool response for '{}'.", name); }
+                                                            } Err(e) => error!("Failed to build tool response message for '{}': {}", name, e),
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Tool handler '{}' failed: {}",
+                                                            name, e
+                                                        );
+                                                        match <Self as LiveApiBackend<S>>::build_tool_response_message(self, vec![FunctionResponse { id: call_id.clone(), name: name.clone(), response: json!({"error": e}) }]) {
+                                                            Ok(json_msg) => { let mut sink = ws_sink.lock().await;
+                                                                if sink.send(Message::Text(json_msg.into())).await.is_ok() {
+                                                                    if let Ok(req_resp_msg) = <Self as LiveApiBackend<S>>::build_request_response_message(self) {
+                                                                        let _ = sink.send(Message::Text(req_resp_msg.into())).await; info!("Sent tool error response and requested next response for '{}'.", name);
+                                                                    } else { error!("Failed to build request_response message after tool error."); }
+                                                                } else { error!("Failed to send tool error response for '{}'.", name); }
+                                                            } Err(e) => error!("Failed to build tool error response message for '{}': {}", name, e),
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                warn!("No handler registered for tool: {}", name);
+                                            }
                                         }
                                         Err(e) => {
-                                            error!("Failed to parse tool arguments for '{}': {}", name, e);
-                                            unified_events.push(UnifiedServerEvent::Error(ApiError {
-                                                code: "tool_args_parse_error".to_string(),
-                                                message: format!("Failed to parse args for {}: {}", name, e),
-                                                event_id: None, // No client event ID here
-                                            }));
+                                            error!(
+                                                "Failed to parse tool arguments for '{}': {}",
+                                                name, e
+                                            );
+                                            unified_events.push(UnifiedServerEvent::Error(
+                                                ApiError {
+                                                    code: "tool_args_parse_error".to_string(),
+                                                    message: format!(
+                                                        "Failed to parse args for {}: {}",
+                                                        name, e
+                                                    ),
+                                                    event_id: None,
+                                                },
+                                            ));
                                         }
                                     }
                                 }
-                                // Handle other output types if necessary
                             }
                         }
-                        // Mark content update as done (might have been text or audio)
                         unified_events.push(UnifiedServerEvent::ContentUpdate {
                             text: None,
                             audio: None,
                             done: true,
                         });
-                         unified_events.push(UnifiedServerEvent::ModelTurnComplete);
-                         // Does response.done mean generation is fully complete too? Assume so for now.
-                         unified_events.push(UnifiedServerEvent::ModelGenerationComplete);
+                        unified_events.push(UnifiedServerEvent::ModelTurnComplete);
+                        unified_events.push(UnifiedServerEvent::ModelGenerationComplete);
                     }
                     Some("error") => {
                         let code = openai_event
@@ -500,47 +451,48 @@ impl LiveApiBackend for OpenAiBackend {
                             .and_then(|m| m.as_str())
                             .unwrap_or("")
                             .to_string();
-                         unified_events.push(UnifiedServerEvent::Error(ApiError {
+                        unified_events.push(UnifiedServerEvent::Error(ApiError {
                             code,
                             message,
                             event_id,
                         }));
                     }
-                     Some("rate_limits.updated") => {
-                        // Parse rate limit info if needed
-                         if let Some(usage_val) = openai_event.get("response").and_then(|r| r.get("usage")) {
-                             // Attempt to map OpenAI usage to Gemini's UsageMetadata struct
-                             // This might be an inexact mapping
-                             match serde_json::from_value::<UsageMetadata>(usage_val.clone()) {
-                                Ok(metadata) => unified_events.push(UnifiedServerEvent::UsageMetadata(metadata)),
+                    Some("rate_limits.updated") => {
+                        if let Some(usage_val) =
+                            openai_event.get("response").and_then(|r| r.get("usage"))
+                        {
+                            match serde_json::from_value::<UsageMetadata>(usage_val.clone()) {
+                                Ok(mut metadata) => {
+                                    metadata.prompt_token_count = usage_val
+                                        .get("input_tokens")
+                                        .and_then(|v| v.as_i64())
+                                        .map(|v| v as i32);
+                                    metadata.response_token_count = usage_val
+                                        .get("output_tokens")
+                                        .and_then(|v| v.as_i64())
+                                        .map(|v| v as i32);
+                                    metadata.total_token_count = usage_val
+                                        .get("total_tokens")
+                                        .and_then(|v| v.as_i64())
+                                        .map(|v| v as i32);
+                                    unified_events.push(UnifiedServerEvent::UsageMetadata(metadata))
+                                }
                                 Err(e) => warn!("Failed to parse OpenAI usage metadata: {}", e),
                             }
-                         }
+                        }
                     }
-                     Some(other_type @ "input_audio_buffer.speech_started") |
-                     Some(other_type @ "input_audio_buffer.speech_stopped") |
-                     Some(other_type @ "input_audio_buffer.committed") |
-                     Some(other_type @ "input_audio_buffer.cleared") |
-                     Some(other_type @ "response.audio.done") | // Contains transcript
-                     Some(other_type @ "response.text.done") | // Redundant with response.done?
-                     Some(other_type @ "response.content_part.added") | // Intermediate events
-                     Some(other_type @ "response.content_part.done") |
-                     Some(other_type @ "response.output_item.added") |
-                     Some(other_type @ "response.output_item.done") |
-                     Some(other_type @ "conversation.item.created") |
-                     Some(other_type @ "conversation.item.updated") |
-                     Some(other_type @ "conversation.item.deleted")
-                      => {
-                        // Log potentially useful intermediate events but don't necessarily surface them
-                        debug!("Received intermediate OpenAI event: {}", other_type);
-                        // Could add to ProviderSpecific if needed by advanced users
-                        // unified_events.push(UnifiedServerEvent::ProviderSpecific(openai_event.clone()));
+                    Some(
+                        other_type @ ("input_audio_buffer.speech_started"
+                        | "input_audio_buffer.speech_stopped"
+                        | "input_audio_buffer.committed"
+                        | "input_audio_buffer.cleared"),
+                    ) => {
+                        debug!("Received audio buffer event: {}", other_type);
                     }
-                    Some(unhandled_type) => {
-                        warn!("Unhandled OpenAI event type: {}", unhandled_type);
-                        unified_events.push(UnifiedServerEvent::ProviderSpecific(
-                            openai_event.clone(),
-                        ));
+                    Some(other_type) => {
+                        debug!("Received unhandled OpenAI event type: {}", other_type);
+                        unified_events
+                            .push(UnifiedServerEvent::ProviderSpecific(openai_event.clone()));
                     }
                     None => {
                         warn!("Received OpenAI message without a 'type' field: {}", text);

@@ -17,8 +17,9 @@ tokio = { version = "1.45.0", features = ["full"] }
 tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-native-roots"] }
 tracing = "0.1.41"
 url = "2.5.4"
-gemini-live-macros = "0.1.0"
+gemini-live-macros = { path = "gemini-live-macros" }
 http = "1.3.1"
+async-trait = "0.1.88"
 
 [dev-dependencies]
 chrono = "0.4.41"
@@ -48,3 +49,7 @@ path = "examples/continuous_audio_chat.rs"
 [[example]]
 name = "continuous_audio_with_tools"
 path = "examples/continuous_audio_with_tools.rs"
+
+[[example]]
+name = "minimal_test"
+path = "examples/minimal_test.rs"

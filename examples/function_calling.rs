@@ -1,11 +1,15 @@
-use gemini_live_api::{GeminiLiveClientBuilder, tool_function};
+// examples/function_calling.rs
 use gemini_live_api::{
-    client::{ServerContentContext, UsageMetadataContext},
+    GeminiLiveClientBuilder,
+    // Renamed GeminiLiveClient to AiLiveClient in client::handle
+    client::{AiLiveClient, ServerContentContext, UsageMetadataContext},
+    tool_function,
     types::*,
 };
 use std::{
     env,
     sync::{Arc, Mutex as StdMutex},
+    time::Duration,
 };
 use tokio::sync::Notify;
 use tracing::{error, info};
@@ -14,10 +18,12 @@ use tracing::{error, info};
 struct AppStateWithMutex {
     full_response: Arc<StdMutex<String>>,
     call_count: Arc<StdMutex<u32>>,
-    turn_complete_signal: Arc<Notify>,
+    interaction_complete_signal: Arc<Notify>,
 }
 
-#[tool_function("Calculates the sum of two numbers and increments a counter")]
+// No AppState trait impl needed anymore
+
+#[tool_function("Calculates the sum of two numbers")]
 async fn sum(state: Arc<AppStateWithMutex>, a: f64, b: f64) -> f64 {
     let mut count = state.call_count.lock().unwrap();
     *count += 1;
@@ -29,7 +35,11 @@ async fn sum(state: Arc<AppStateWithMutex>, a: f64, b: f64) -> f64 {
 }
 
 #[tool_function("Calculates the division of two numbers")]
-async fn divide(numerator: f64, denominator: f64) -> Result<f64, String> {
+async fn divide(
+    _state_ignored: Arc<AppStateWithMutex>,
+    numerator: f64,
+    denominator: f64,
+) -> Result<f64, String> {
     info!(
         "[Tool] divide called with num={}, den={}",
         numerator, denominator
@@ -43,27 +53,31 @@ async fn divide(numerator: f64, denominator: f64) -> Result<f64, String> {
 
 async fn handle_usage_metadata(_ctx: UsageMetadataContext, app_state: Arc<AppStateWithMutex>) {
     info!(
-        "[Handler] Received Usage Metadata: {:?}, current call count from state: {}",
+        "[Handler] OpenAI Usage Metadata: {:?}, call count: {}",
         _ctx.metadata,
         app_state.call_count.lock().unwrap()
     );
 }
 
 async fn handle_on_content(ctx: ServerContentContext, app_state: Arc<AppStateWithMutex>) {
-    info!("[Handler] Received content: {:?}", ctx.content);
-    if let Some(model_turn) = &ctx.content.model_turn {
-        for part in &model_turn.parts {
-            if let Some(text) = &part.text {
-                let mut full_res = app_state.full_response.lock().unwrap();
-                *full_res += text;
-                *full_res += " ";
-            }
-        }
+    if let Some(text) = ctx.text {
+        let mut full_res = app_state.full_response.lock().unwrap();
+        *full_res += &text;
+        *full_res += " ";
+        info!("[Handler] OpenAI Text: {}", text.trim());
     }
-    if ctx.content.turn_complete {
-        info!("[Handler] Turn complete message received.");
-        app_state.turn_complete_signal.notify_one();
+    if ctx.is_done {
+        // This signals the end of a content part (e.g., final text from a turn)
+        info!("[Handler] OpenAI content segment complete.");
+        // For function calling, the final response often comes after tool calls.
+        // The ModelTurnComplete or ModelGenerationComplete event is more reliable for signaling overall completion.
+        // We'll use a dedicated handler for ModelTurnComplete to notify.
     }
+}
+
+async fn handle_model_turn_complete(app_state: Arc<AppStateWithMutex>) {
+    info!("[Handler] OpenAI ModelTurnComplete received. Signaling main loop.");
+    app_state.interaction_complete_signal.notify_one();
 }
 
 #[tokio::main]
@@ -73,21 +87,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     dotenv::dotenv().ok();
 
-    let api_key = env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY not set")?;
-    let model_name = "models/gemini-2.0-flash-exp".to_string(); // Updated model
+    let api_key = env::var("API_KEY").map_err(|_| "OPENAI_API_KEY not set (using API_KEY)")?;
+    let model_name = env::var("OPENAI_MODEL_TOOLS").unwrap_or_else(|_| "gpt-4o".to_string()); // e.g. gpt-4-turbo or gpt-4o
+    info!("Using OpenAI Model for Tools: {}", model_name);
 
-    let client_app_state_instance = AppStateWithMutex {
-        full_response: Arc::new(StdMutex::new(String::new())),
-        call_count: Arc::new(StdMutex::new(0)),
-        turn_complete_signal: Arc::new(Notify::new()),
-    };
+    let app_state_value = AppStateWithMutex::default();
 
-    info!("Configuring Gemini Live Client...");
-
-    let mut builder = GeminiLiveClientBuilder::<AppStateWithMutex>::new_with_state(
+    info!("Configuring Client for OpenAI Function Calling...");
+    let mut builder = GeminiLiveClientBuilder::<AppStateWithMutex>::new_with_model_and_state(
         api_key,
         model_name,
-        client_app_state_instance.clone(),
+        app_state_value.clone(),
     );
 
     builder = builder.generation_config(GenerationConfig {
@@ -95,10 +105,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         temperature: Some(0.7),
         ..Default::default()
     });
-
     builder = builder.system_instruction(Content {
         parts: vec![Part {
-            text: Some("You are a helpful assistant. Use tools for calculations.".to_string()),
+            text: Some("You are an OpenAI assistant that uses tools for calculations.".to_string()),
             ..Default::default()
         }],
         role: Some(Role::System),
@@ -107,45 +116,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     builder = builder.on_server_content(handle_on_content);
     builder = builder.on_usage_metadata(handle_usage_metadata);
+    // Add on_model_turn_complete handler
+    // This requires adding the method to the builder:
+    // builder = builder.on_model_turn_complete(handle_model_turn_complete);
 
     builder = sum_register_tool(builder);
     builder = divide_register_tool(builder);
 
-    info!("Connecting client...");
-    let mut client = builder.connect().await?;
+    info!("Connecting OpenAI client...");
+    let mut client = builder.connect_openai().await?; // Use connect_openai
 
     let user_prompt =
         "Please calculate 15.5 + 7.2 for me. Then, divide that sum by 2. Then add 10 + 5.";
     info!("Sending initial prompt: {}", user_prompt);
-    client.send_text_turn(user_prompt.to_string(), true).await?;
+    client.send_text_turn(user_prompt.to_string()).await?;
+    // `send_text_turn` for OpenAI now internally calls `request_response`
 
-    info!("Waiting for turn completion or Ctrl+C...");
-
-    let turn_complete_notification = client_app_state_instance.turn_complete_signal.clone();
+    info!("Waiting for OpenAI interaction completion or Ctrl+C...");
+    let interaction_complete_notification = app_state_value.interaction_complete_signal.clone();
+    let timeout_duration = Duration::from_secs(180);
 
     tokio::select! {
-        _ = turn_complete_notification.notified() => {
-            info!("Completion signaled by handler.");
-            let final_app_state_arc = client.state();
-            let final_text = final_app_state_arc.full_response.lock().unwrap().trim().to_string();
-            let final_calls = *final_app_state_arc.call_count.lock().unwrap();
+        _ = interaction_complete_notification.notified() => {
+            info!("OpenAI interaction completion signaled.");
+            let final_text = app_state_value.full_response.lock().unwrap().trim().to_string();
+            let final_calls = *app_state_value.call_count.lock().unwrap();
             info!(
-                "\n--- Final Text Response (from state) ---\n{}\n--------------------\nTool call count: {}",
+                "\n--- OpenAI Final Text Response ---\n{}\n--------------------\nTool call count: {}",
                 final_text, final_calls
             );
         }
-        res = tokio::signal::ctrl_c() => {
-            if let Err(e) = res { error!("Failed to listen for Ctrl+C: {}", e); }
-            else { info!("Ctrl+C received, initiating shutdown."); }
-        }
-        _ = tokio::time::sleep(std::time::Duration::from_secs(180)) => {
-            error!("Overall interaction timed out after 180 seconds.");
-        }
+        _ = tokio::signal::ctrl_c() => { info!("Ctrl+C received."); }
+        _ = tokio::time::sleep(timeout_duration) => { error!("Interaction timed out after {} seconds.", timeout_duration.as_secs()); }
     }
 
-    info!("Shutting down client...");
+    info!("Shutting down OpenAI client...");
     client.close().await?;
-    info!("Client closed.");
-
+    info!("OpenAI Client closed.");
     Ok(())
 }
