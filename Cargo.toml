@@ -1,0 +1,49 @@
+[package]
+name = "gemini-live-api"
+version = "0.1.1"
+edition = "2024"
+authors = ["Esteban Forero"]
+description = "Crate to interact with the Gemini live API"
+license = "MIT"
+
+[dependencies]
+base64 = "0.22.1"
+futures-util = "0.3.31"
+rustls = "0.23.27"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+tokio = { version = "1.45.0", features = ["full"] }
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-native-roots"] }
+tracing = "0.1.41"
+url = "2.5.4"
+gemini-live-macros = "0.1.0"
+
+[dev-dependencies]
+chrono = "0.4.41"
+anyhow = "1.0.98"
+crossbeam-channel = "0.5.15"
+tokio = { version = "1.39.2", features = ["macros", "rt-multi-thread"] }
+dotenv = "0.15.0"
+cpal = "0.15.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# [[example]]
+# name = "basic_chat"
+# path = "examples/basic_chat.rs"
+
+[[example]]
+name = "function_calling"
+path = "examples/function_calling.rs"
+
+[[example]]
+name = "audio_streaming"
+path = "examples/audio_streaming.rs"
+
+[[example]]
+name = "continuous_audio_chat"
+path = "examples/continuous_audio_chat.rs"
+
+[[example]]
+name = "continuous_audio_with_tools"
+path = "examples/continuous_audio_with_tools.rs"
